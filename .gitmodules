@@ -1,0 +1,3 @@
+[submodule "assets/menagerie"]
+	path = assets/menagerie
+	url = https://github.com/google-deepmind/mujoco_menagerie.git

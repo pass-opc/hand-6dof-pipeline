@@ -35,9 +35,10 @@ output/*
 !output/.gitkeep
 
 # ============================================================================
-# Large third-party model assets (download via scripts/_download_hamer.py)
+# Large third-party model assets — download via README §2.1 instructions
 # ============================================================================
 assets/hamer/_DATA/
+assets/dex-urdf/
 *.tar.gz
 
 # ============================================================================
@@ -51,3 +52,15 @@ tests/legacy/
 # One-off diagnostic / debug artifacts
 # ============================================================================
 MJMODEL.TXT
+MUJOCO_LOG.TXT
+
+# ============================================================================
+# Orbbec SDK runtime log (auto-generated on every pyorbbecsdk2 init)
+# ============================================================================
+Log/
+
+# ============================================================================
+# MuJoCo sim scene cache (replay/sim/mujoco_dex generates host-dependent
+# absolute meshdir paths into these; never commit)
+# ============================================================================
+replay/sim/scenes/_*

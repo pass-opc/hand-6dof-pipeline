@@ -7,7 +7,7 @@
 - **怎么**做（知识点 + 架构 + 文件清单）
 - **现在做到什么程度**（Milestone + 未来一句话延申）
 
-对照 `CLAUDE.md` 红线：sim 是下游消费者（消费 LeRobotDataset），和真机回放 `04_replay_on_arm.py` 并列，不替代、不越位。
+对照 `CLAUDE.md` 红线：sim 是下游消费者（消费 `.qpos.npz`），和真臂回放 `replay/real/so101.py` 并列，不替代、不越位。
 
 ---
 
@@ -79,7 +79,7 @@
 - 每帧 `for t` 的循环变量会被下一帧覆盖，没有 list 累积，**不存在爆内存**——跑 10 万帧也只占用单帧的几十字节
 
 **`scene` 是什么**：
-- 不是 MJCF 文件，是 `sim.mujoco_loader.LoadedScene` 这个 dataclass，一次性打包：
+- 不是 MJCF 文件，是 `replay.sim.mujoco_loader.LoadedScene` 这个 dataclass，一次性打包：
   - `model` / `data`：MuJoCo 两个原生对象
   - `lerobot_to_qpos_idx` / `lerobot_to_ctrl_idx`：LeRobot 关节名 → 数组下标
   - `joint_range_rad`：`jnt_range` 查表（用于 WARN 判断）
@@ -161,10 +161,10 @@ LeRobotDataset (v3.0)  [已有]
 scripts/05_replay_in_sim.py  [入口 CLI]
     │  --dataset <repo_id> --episode <id> [--hz 30] [--no-gui] [--scene <path>]
     ▼
-sim/mujoco_loader.py
+replay/sim/mujoco_loader.py
     │  加载 MJCF、建立 joint_name → qpos_idx 映射、暴露 model/data
     ▼
-sim/mujoco_replay.py
+replay/sim/mujoco_so101.py
     │  for t in range(T):
     │      data.ctrl[:] = action[t] (经过 joint_map)
     │      mj_kinematics(model, data)  # Phase 1.0 纯运动学
@@ -189,9 +189,9 @@ Rerun Viewer (多模态 debug)
 
 | 文件 | 作用 | 输入 | 输出 |
 |------|------|------|------|
-| `sim/__init__.py` | 模块标识 | — | — |
-| `sim/mujoco_loader.py` | 加载 MJCF + 场景；构建 `dataset_joint_name → qpos_idx` 映射；封装 model/data 初始化 | `scene_xml_path`, `joint_name_map` | `(MjModel, MjData, joint_idx_list)` |
-| `sim/mujoco_replay.py` | 核心回放：逐帧 ctrl 驱动 + viewer 同步；支持暂停/步进/速率控制 | `MjModel, MjData, action_sequence, hz` | 副作用：渲染 |
+| `replay/sim/__init__.py` | 模块标识 | — | — |
+| `replay/sim/mujoco_loader.py` | 加载 MJCF + 场景；构建 `dataset_joint_name → qpos_idx` 映射；封装 model/data 初始化 | `scene_xml_path`, `joint_name_map` | `(MjModel, MjData, joint_idx_list)` |
+| `replay/sim/mujoco_so101.py` | SO-101 回放：逐帧 ctrl 驱动 + viewer 同步；支持暂停/步进/速率控制 | `MjModel, MjData, action_sequence, hz` | 副作用：渲染 |
 | `scripts/05_replay_in_sim.py` | CLI 入口：解析 args、读 LeRobotDataset 的指定 episode、调用 replay | CLI args | stdout 日志 |
 | `assets/mujoco/trs_so101/` | SO-ARM101 URDF+MJCF 同源资产（从 TheRobotStudio `Simulation/SO101/` 拷贝） | — | — |
 | `LICENSE_THIRD_PARTY.md` | 第三方来源 + license 汇总（TheRobotStudio SO-ARM101，Apache-2.0） | — | — |
@@ -223,51 +223,42 @@ Rerun Viewer (多模态 debug)
 - [x] 在 viewer 里手动拖 slider，6 个 joint 都能动到边界
 
 ### M3 Episode 回放 ✅ 已完成
-- [x] 实现 `sim/mujoco_loader.py` + `sim/mujoco_replay.py` + `scripts/05_replay_in_sim.py`
-- [x] 读 HaMeR v3 数据集 episode 2 并回放（`--scale 0.5` 按 memory 要求）
-- [x] `tests/test_sim_replay.py` 14 项全通过（loader + replay + script subprocess smoke）
+- [x] 实现 `replay/sim/mujoco_loader.py` + `replay/sim/mujoco_so101.py`（`run()` 入口）+ `replay/real/so101.py`（真臂入口）；走 `python -m replay` CLI
+- [x] 读 02_processed → `python -m retarget --robot so101` → `.qpos.npz` → `python -m replay --output mp4` 链路全通
+- [x] `tests/test_replay_so101.py` + `tests/test_retarget_so101.py` 全通过（loader + replay + run() mp4 smoke + real backend dry-run）
 - [x] GUI lifecycle：跑完不消失、支持 `--loop`、响应关窗
 
 ### M4 和真机对比（可选）
-- [ ] 同一 episode 仿真 + 真机各跑一遍（`04_replay_on_arm.py --scale 0.5`）
+- [ ] 同一 episode sim + 真机各跑一遍（`python -m replay --output mp4` vs `--output real`）
 - [ ] 末端位置曲线（sim FK vs real FK）叠加看偏差
-
-### M5 03 pipeline 集成 ✅ 已完成
-- [x] `03_build_dataset.py --sim-check` 跑完 build 后批量 headless replay 前 N 个 episode
-- [x] 通过 grep `[mujoco] WARN` 分类 PASS / WARN(n) / FAIL
-- [x] 设计为**软信号**：不阻断 build，只在终端展示"建议复查"列表
 
 ---
 
 ## 6. 运行命令速查
 
+两步：retarget 把 `.processed.npz`（cam 帧 wrist+joints）转成 `.qpos.npz`（arm 关节），replay 拿 `.qpos.npz` 派发到 viewer / mp4 / 真臂。
+
 ```bash
 conda activate lerobot
-cd hand-6dof-pipeline
+cd code/opc_data_pipeline
 
-# ---- 人工预览：GUI，跑完保持最后一帧 ----
-python scripts/05_replay_in_sim.py \
-    --dataset-root output/03_dataset_v3 \
-    --episode 2 --scale 0.5
+# ---- Step 5: retarget ----
+python -m retarget --robot so101 --hand right \
+    --source-root output/iphone/<batch>/02_processed
+# 输出 → output/iphone/<batch>/05_qpos_so101/<sid>/<sid>.qpos.npz
 
-# 循环播放（反复对比同一动作）
-python scripts/05_replay_in_sim.py \
-    --dataset-root output/03_dataset_v3 \
-    --episode 2 --scale 0.5 --loop
+# ---- Step 6a: GUI 预览 ----
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_so101
+# 默认循环；--no-loop 单次播完留窗口
 
-# ---- 批量 / CI 冒烟：headless 加速，用于门禁 ----
-python scripts/05_replay_in_sim.py \
-    --dataset-root output/03_dataset_v3 \
-    --episode 2 --scale 0.5 \
-    --speed 20.0 --no-gui
+# ---- Step 6b: 批量 mp4（CI / 归档 / 远程预览）----
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_so101 \
+    --output mp4 --width 640 --height 480
 
-# ---- 建 dataset 的同时跑 sim-check（03 集成入口） ----
-python scripts/03_build_dataset.py \
-    --processed output/02_processed.pkl \
-    --r3d-dir data/raw \
-    --output-dir output/03_dataset_v3 \
-    --repo-id <user>/demo_v3 --task "pick up cup" --hand right \
-    --sim-check --sim-check-episodes 3 --sim-check-scale 0.5
+# ---- Step 6c: 真臂回放 ----
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_so101 \
+    --output real --port COM5 --speed 0.3
+# 加 --dry-run 不连串口，仅 decode 校验
 ```
 
 **`--sim-check` 输出样例**：

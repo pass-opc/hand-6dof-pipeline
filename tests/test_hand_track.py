@@ -2,20 +2,20 @@
 Tests for scripts/01_hand_track.py (perception layer, cam-frame only).
 
 Covers:
-  1. process_episode — dual-hand output, cam-frame contract
-  2. Single hand — other hand stays NaN
-  3. Empty detections
-  4. Gripper width from joints
-  5. bbox passthrough
-  6. Output contract — coord_frame='camera', T_world_cam + K passthrough,
-     joints_cam shape
-  7. Helpers
+  1. process_episode end-to-end → flat-key npz on disk
+  2. Single-hand episode (other hand stays NaN)
+  3. No detections → all NaN
+  4. bbox + confidence passthrough
+  5. T_world_cam + K passthrough
+  6. timestamps_us conversion to int64 microseconds
+  7. _make_empty_hand_arrays helper
 
-World-frame transform / filter / centering now live in 02_process.py and
-are tested by tests/test_process.py.
+01 is cam-frame only — no world transform / no trim / no quality / no
+gripper_width (derivable downstream). World transform / smoothing / IK
+all live in 04_build_so101.py per the iPhone-line raw-first refactor.
 
 Run:
-    cd hand-6dof-pipeline
+    cd code/opc_data_pipeline
     python -m pytest tests/test_hand_track.py -v
 """
 
@@ -29,14 +29,18 @@ import cv2
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 
-# 01_hand_track.py starts with a digit — import via spec
+# 01_hand_track.py starts with a digit — import via spec.
+# Register in sys.modules BEFORE exec_module so @dataclass works (it does
+# `sys.modules[cls.__module__]` lookups during class creation).
 _spec = importlib.util.spec_from_file_location(
-    "hand_track",
-    str(Path(__file__).resolve().parent.parent / "scripts" / "01_hand_track.py"),
+    "iphone_01_hand_track",
+    str(_PROJECT_ROOT / "scripts" / "01_hand_track.py"),
 )
 _hand_track = importlib.util.module_from_spec(_spec)
+sys.modules["iphone_01_hand_track"] = _hand_track
 _spec.loader.exec_module(_hand_track)
 
 HandTrackConfig = _hand_track.HandTrackConfig
@@ -72,7 +76,7 @@ def make_detection(handedness="right", z=0.5, confidence=0.9,
     for i in range(21):
         joints[i] = [i * 0.01, 0.0, z]
     joints[4] = [0.0, 0.0, z]       # thumb tip
-    joints[8] = [0.05, 0.0, z]      # index tip (gripper width = 0.05)
+    joints[8] = [0.05, 0.0, z]      # index tip (gripper width = 0.05 m)
     return HandDetection(
         handedness=handedness,
         wrist_pos=np.array([wrist_xy[0], wrist_xy[1], z]),
@@ -94,9 +98,10 @@ def create_synthetic_r3d(
     poses: list[list[float]] | None = None,
     w: int = 32,
     h: int = 48,  # portrait by default (w <= h → no rotation)
+    name: str = "test_episode",
 ) -> Path:
     """Create a minimal .r3d file with synthetic frames + per-frame poses."""
-    r3d_path = tmp_path / "test_episode.r3d"
+    r3d_path = tmp_path / f"{name}.r3d"
 
     img = np.zeros((h, w, 3), dtype=np.uint8)
     _, img_bytes = cv2.imencode(".jpg", img)
@@ -121,86 +126,99 @@ def create_synthetic_r3d(
     return r3d_path
 
 
+def _run_and_load(tmp_path, n_frames, detections, *, poses=None):
+    """Run process_episode → load resulting .tracking.npz from disk."""
+    r3d = create_synthetic_r3d(tmp_path, n_frames=n_frames, poses=poses)
+    tracker = MockTracker(detections)
+    config = HandTrackConfig(read_depth=False)
+    output_root = tmp_path / "01_tracking"
+    process_episode(r3d, output_root=output_root, config=config, tracker=tracker)
+    npz_path = output_root / "test_episode" / "test_episode.tracking.npz"
+    assert npz_path.exists(), f"Expected output at {npz_path}"
+    return np.load(npz_path, allow_pickle=True)
+
+
 # ============================================================
-# 1. Dual-hand output + cam-frame contract
+# 1. process_episode end-to-end
 # ============================================================
 
 class TestProcessEpisode:
 
-    def test_both_hands_detected(self, tmp_path):
-        r3d = create_synthetic_r3d(tmp_path, n_frames=3)
+    def test_dual_hand_npz_schema(self, tmp_path):
+        """Both hands detected → flat-key npz with full schema."""
+        n = 3
         detections = [
             [make_detection("left"), make_detection("right")],
             [make_detection("left"), make_detection("right")],
             [make_detection("left"), make_detection("right")],
         ]
-        tracker = MockTracker(detections)
-        config = HandTrackConfig(read_depth=False)
+        d = _run_and_load(tmp_path, n, detections)
 
-        result = process_episode(r3d, config, tracker)
+        # Top-level keys
+        assert "timestamps_us" in d.files
+        assert d["timestamps_us"].dtype == np.int64
+        assert d["timestamps_us"].shape == (n,)
+        assert "K" in d.files
+        assert d["K"].shape == (3, 3)
+        assert "T_world_cam" in d.files
+        assert d["T_world_cam"].shape == (n, 4, 4)
+        assert "source" in d.files
+        assert str(d["source"]) == "mock"
+        assert "episode_name" in d.files
+        assert str(d["episode_name"]) == "test_episode"
+        assert str(d["coord_frame"]) == "camera"
 
-        assert "timestamps" in result
-        assert "left_hand" in result
-        assert "right_hand" in result
-        assert result["source"] == "mock"
-        assert len(result["timestamps"]) == 3
+        # Per-hand flat keys (no nested dicts in npz)
+        for hand in ("left", "right"):
+            assert f"{hand}_wrist_cam" in d.files
+            assert d[f"{hand}_wrist_cam"].shape == (n, 3)
+            assert f"{hand}_wrist_rot_cam" in d.files
+            assert d[f"{hand}_wrist_rot_cam"].shape == (n, 3)
+            assert f"{hand}_joints_cam" in d.files
+            assert d[f"{hand}_joints_cam"].shape == (n, 21, 3)
+            assert f"{hand}_bbox" in d.files
+            assert d[f"{hand}_bbox"].shape == (n, 4)
+            assert f"{hand}_confidence" in d.files
+            assert d[f"{hand}_confidence"].shape == (n,)
+            # All detected → no NaN
+            assert not np.any(np.isnan(d[f"{hand}_wrist_cam"]))
 
-        for hand in ("left_hand", "right_hand"):
-            h = result[hand]
-            assert not np.any(np.isnan(h["wrist_cam"]))
-            assert h["wrist_cam"].shape == (3, 3)
-            assert h["wrist_rot_cam"].shape == (3, 3)
-            assert h["gripper_width"].shape == (3,)
-            assert h["joints_cam"].shape == (3, 21, 3)
-            assert h["confidence"].shape == (3,)
-            assert h["bbox"].shape == (3, 4)
-
-    def test_output_contract(self, tmp_path):
-        """Cam-frame contract: coord_frame='camera', T_world_cam + K passthrough."""
+    def test_meta_json_sidecar(self, tmp_path):
+        """Sidecar .tracking.meta.json contains backend + detection stats."""
         r3d = create_synthetic_r3d(tmp_path, n_frames=2)
-        tracker = MockTracker([[make_detection("right")], [make_detection("right")]])
+        tracker = MockTracker([[make_detection("right")] for _ in range(2)])
         config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        assert result["coord_frame"] == "camera"
-        assert "T_world_cam" in result
-        assert result["T_world_cam"].shape == (2, 4, 4)
-        assert "K" in result
-        assert result["K"].shape == (3, 3)
-        assert result["episode_name"] == "test_episode"
-
-        for hand_key in ("left_hand", "right_hand"):
-            hand = result[hand_key]
-            for k in ("wrist_cam", "wrist_rot_cam", "joints_cam",
-                      "bbox", "gripper_width", "confidence"):
-                assert k in hand, f"missing {k} in {hand_key}"
+        output_root = tmp_path / "01_tracking"
+        process_episode(r3d, output_root=output_root, config=config,
+                        tracker=tracker)
+        meta_path = output_root / "test_episode" / "test_episode.tracking.meta.json"
+        assert meta_path.exists()
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["session_id"] == "test_episode"
+        assert meta["n_frames"] == 2
+        assert meta["detection"]["right_frames"] == 2
+        assert meta["detection"]["left_frames"] == 0
 
 
 # ============================================================
-# 2. Single hand
+# 2. Single hand only
 # ============================================================
 
 class TestSingleHand:
 
     def test_right_only(self, tmp_path):
-        r3d = create_synthetic_r3d(tmp_path, n_frames=3)
-        detections = [[make_detection("right")] for _ in range(3)]
-        tracker = MockTracker(detections)
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        assert not np.any(np.isnan(result["right_hand"]["wrist_cam"]))
-        assert np.all(np.isnan(result["left_hand"]["wrist_cam"]))
+        n = 3
+        detections = [[make_detection("right")] for _ in range(n)]
+        d = _run_and_load(tmp_path, n, detections)
+        assert not np.any(np.isnan(d["right_wrist_cam"]))
+        assert np.all(np.isnan(d["left_wrist_cam"]))
 
     def test_left_only(self, tmp_path):
-        r3d = create_synthetic_r3d(tmp_path, n_frames=3)
-        detections = [[make_detection("left")] for _ in range(3)]
-        tracker = MockTracker(detections)
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        assert not np.any(np.isnan(result["left_hand"]["wrist_cam"]))
-        assert np.all(np.isnan(result["right_hand"]["wrist_cam"]))
+        n = 3
+        detections = [[make_detection("left")] for _ in range(n)]
+        d = _run_and_load(tmp_path, n, detections)
+        assert not np.any(np.isnan(d["left_wrist_cam"]))
+        assert np.all(np.isnan(d["right_wrist_cam"]))
 
 
 # ============================================================
@@ -210,108 +228,76 @@ class TestSingleHand:
 class TestNoDetection:
 
     def test_empty_frames(self, tmp_path):
-        r3d = create_synthetic_r3d(tmp_path, n_frames=3)
-        tracker = MockTracker([[] for _ in range(3)])
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        assert np.all(np.isnan(result["left_hand"]["wrist_cam"]))
-        assert np.all(np.isnan(result["right_hand"]["wrist_cam"]))
-        assert len(result["timestamps"]) == 3
+        n = 3
+        d = _run_and_load(tmp_path, n, [[] for _ in range(n)])
+        assert np.all(np.isnan(d["left_wrist_cam"]))
+        assert np.all(np.isnan(d["right_wrist_cam"]))
+        assert d["timestamps_us"].shape == (n,)
 
 
 # ============================================================
-# 4. Gripper width
+# 4. bbox / confidence passthrough
 # ============================================================
 
-class TestGripperWidth:
-
-    def test_gripper_width_stored(self, tmp_path):
-        r3d = create_synthetic_r3d(tmp_path, n_frames=2)
-        detections = [[make_detection("right")] for _ in range(2)]
-        tracker = MockTracker(detections)
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        np.testing.assert_allclose(
-            result["right_hand"]["gripper_width"],
-            [0.05, 0.05], atol=1e-10,
-        )
-
-
-# ============================================================
-# 5. bbox passthrough
-# ============================================================
-
-class TestBbox:
+class TestPassthrough:
 
     def test_bbox_values(self, tmp_path):
-        """bbox provided on detection must land in output verbatim."""
-        r3d = create_synthetic_r3d(tmp_path, n_frames=2)
         det = make_detection("right", bbox=(11.0, 22.0, 33.0, 44.0))
-        tracker = MockTracker([[det], [det]])
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
+        d = _run_and_load(tmp_path, 2, [[det], [det]])
         np.testing.assert_allclose(
-            result["right_hand"]["bbox"][0], [11.0, 22.0, 33.0, 44.0], atol=1e-10,
+            d["right_bbox"][0], [11.0, 22.0, 33.0, 44.0], atol=1e-10,
         )
 
+    def test_confidence_values(self, tmp_path):
+        det = make_detection("right", confidence=0.77)
+        d = _run_and_load(tmp_path, 2, [[det], [det]])
+        np.testing.assert_allclose(d["right_confidence"], [0.77, 0.77])
+
 
 # ============================================================
-# 6. Cam-frame passthrough (no world transform in 01)
+# 5. T_world_cam + K passthrough (no world transform in 01)
 # ============================================================
 
-class TestCamFramePassthrough:
-    """01 is cam-frame only. No matter what T_world_cam is, wrist_cam and
-    joints_cam stay in camera frame and equal the detector output."""
+class TestCamFrameContract:
 
     def test_wrist_cam_equals_detector_output(self, tmp_path):
-        """Non-trivial T_world_cam does NOT affect wrist_cam (stays in cam)."""
-        # Translation pose: t_wc = (5, 6, 7). Would shift wrist if applied.
+        """Non-trivial T_world_cam does NOT affect wrist_cam — stays in cam."""
         poses = [[0.0, 0.0, 0.0, 1.0, 5.0, 6.0, 7.0]] * 2
-        r3d = create_synthetic_r3d(tmp_path, n_frames=2, poses=poses)
         det = make_detection("right", z=0.5, wrist_xy=(0.1, -0.05))
-        tracker = MockTracker([[det], [det]])
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        # wrist_cam must equal the detector output, not pose-translated value
+        d = _run_and_load(tmp_path, 2, [[det], [det]], poses=poses)
         np.testing.assert_allclose(
-            result["right_hand"]["wrist_cam"][0],
-            [0.1, -0.05, 0.5], atol=1e-10,
-        )
-
-    def test_joints_cam_equals_detector_output(self, tmp_path):
-        poses = [[0.0, 0.0, 0.0, 1.0, 5.0, 6.0, 7.0]] * 2
-        r3d = create_synthetic_r3d(tmp_path, n_frames=2, poses=poses)
-        det = make_detection("right", z=0.5)
-        tracker = MockTracker([[det], [det]])
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        # joints[0] from make_detection: [0, 0, z]
-        np.testing.assert_allclose(
-            result["right_hand"]["joints_cam"][0, 0],
-            [0.0, 0.0, 0.5], atol=1e-10,
+            d["right_wrist_cam"][0], [0.1, -0.05, 0.5], atol=1e-10,
         )
 
     def test_T_world_cam_passthrough(self, tmp_path):
-        """Non-identity T_world_cam must be preserved for 02 to consume."""
+        """Non-identity T_world_cam preserved per-frame for 02 to consume."""
         poses = [[0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 3.0]] * 2
-        r3d = create_synthetic_r3d(tmp_path, n_frames=2, poses=poses)
-        tracker = MockTracker([[make_detection("right")] for _ in range(2)])
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-
-        # Identity R (portrait), translation (1, 2, 3) from pose
+        d = _run_and_load(tmp_path, 2, [[] for _ in range(2)], poses=poses)
         np.testing.assert_allclose(
-            result["T_world_cam"][0, :3, 3], [1.0, 2.0, 3.0], atol=1e-10,
+            d["T_world_cam"][0, :3, 3], [1.0, 2.0, 3.0], atol=1e-10,
         )
 
 
 # ============================================================
-# 7. Helpers
+# 6. timestamps_us conversion
+# ============================================================
+
+class TestTimestamps:
+
+    def test_microsecond_int64(self, tmp_path):
+        """Record3D float seconds → int64 microseconds (cross-line consistent)."""
+        n = 3
+        d = _run_and_load(tmp_path, n, [[] for _ in range(n)])
+        # frameTimestamps in fixture is [0, 1/30, 2/30] seconds.
+        # → microseconds: [0, 33333, 66666] (rounding to nearest int).
+        expected_us = np.array([0, 33333, 66666], dtype=np.int64)
+        # Allow ±1 us due to float→int rounding.
+        np.testing.assert_allclose(d["timestamps_us"], expected_us, atol=1)
+        assert d["timestamps_us"].dtype == np.int64
+
+
+# ============================================================
+# 7. _make_empty_hand_arrays helper
 # ============================================================
 
 class TestHelpers:
@@ -320,33 +306,14 @@ class TestHelpers:
         hand = _make_empty_hand_arrays(10)
         assert hand["wrist_cam"].shape == (10, 3)
         assert hand["wrist_rot_cam"].shape == (10, 3)
-        assert hand["gripper_width"].shape == (10,)
         assert hand["joints_cam"].shape == (10, 21, 3)
         assert hand["confidence"].shape == (10,)
         assert hand["bbox"].shape == (10, 4)
+        assert "gripper_width" not in hand, (
+            "gripper_width must NOT be stored (matches HAND_FIELDS / 335)"
+        )
         assert np.all(np.isnan(hand["wrist_cam"]))
         assert np.all(hand["confidence"] == 0.0)
-
-
-# ============================================================
-# 8. Metadata
-# ============================================================
-
-class TestMetadata:
-
-    def test_episode_name(self, tmp_path):
-        r3d = create_synthetic_r3d(tmp_path, n_frames=2)
-        tracker = MockTracker([[] for _ in range(2)])
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-        assert result["episode_name"] == "test_episode"
-
-    def test_source_from_backend(self, tmp_path):
-        r3d = create_synthetic_r3d(tmp_path, n_frames=2)
-        tracker = MockTracker([[] for _ in range(2)])
-        config = HandTrackConfig(read_depth=False)
-        result = process_episode(r3d, config, tracker)
-        assert result["source"] == "mock"
 
 
 if __name__ == "__main__":

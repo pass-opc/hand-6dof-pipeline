@@ -1,5 +1,5 @@
 """
-Tests for utils/depth_correction.py
+Tests for utils/hand_tracker/depth_correction.py
 
 Covers:
   1. Identity correction (z_hamer == z_lidar)
@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.depth_correction import correct_depth_perspective, print_depth_correction_summary
+from utils.hand_tracker.depth_correction import correct_depth_perspective, print_depth_correction_summary
 
 ATOL = 1e-6
 

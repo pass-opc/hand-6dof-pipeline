@@ -1,7 +1,7 @@
 """
 Load the SO-ARM101 MJCF and bridge LeRobot joint names to MuJoCo qpos / ctrl.
 
-Pipeline position: helper for scripts/05_replay_in_sim.py.
+Pipeline position: helper for replay/sim/mujoco_so101.py.
 
 Input:  scene_xml_path (TheRobotStudio SO-ARM100 Simulation/SO101/scene.xml),
         joint dicts in LeRobot naming (shoulder_pan, shoulder_lift, ...).

@@ -1,327 +1,272 @@
-# hand-6dof-pipeline
+# opc_data_pipeline
 
-**iPhone RGB-D 采集 → 裸手 6DoF 追踪 → LeRobot v3 数据集 → SO-ARM 101 真机 / MuJoCo 仿真回放**
+**人类裸手操作数据采集与验证**——iPhone Pro RGB-D + 完整人手运动（MANO 21 关节 + 6DoF wrist）→ 多本体 retargeting → LeRobot v3 标准化打包 → 仿真 / 真臂回放闭环验证。
 
-为具身智能策略（DP / ACT 等）提供"人类操作演示"训练数据的端到端离线流水线。上游单目 RGB-D + LiDAR（Record3D / ARKit），下游产出 [LeRobot v3](https://github.com/huggingface/lerobot) Parquet + MP4 数据集。
+OPC 为中腰部机器人公司提供具身智能策略（DP / ACT / VLA 等）训练用的人类裸手操作演示数据。本仓库是采集 → 处理 → 打包 → retarget → sim/real 回放的端到端离线工具链。
 
 ---
 
-## 1. Pipeline 主线
+## 1. 录制与执行的两层结构
+
+**录制层**（`scripts/`）按设备分线，stages 01-03，输出 raw `.processed.npz` + 交付用 LeRobot v3。
+**执行层**（`retarget/` `replay/`）录制无关，按"目标机器人 × 仿真/真机"分派，stages 05-06。
 
 ```
-   .r3d  (Record3D, ARKit VIO + LiDAR @ 60 fps)
-     │
-     ▼
- ┌──────────────────────────────────────────────────────────────┐
- │ [01] 01_hand_track.py         (感知：HaMeR + MediaPipe + LiDAR)│
- │      cam-frame tracking.pkl                                   │
- └──────────────────────────────────────────────────────────────┘
-     │
-     ▼
- ┌──────────────────────────────────────────────────────────────┐
- │ [02] 02_process.py            (世界系 + 质量门控 + 滤波)       │
- │      processed.pkl （episode-local world frame, 7D state）     │
- └──────────────────────────────────────────────────────────────┘
-     │
-     ▼
- ┌──────────────────────────────────────────────────────────────┐
- │ [03] 03_build_dataset.py      (LeRobot v3 打包 ± sim-check)    │
- │      Parquet + MP4（可直接训 DP / ACT）                        │
- └──────────────────────────────────────────────────────────────┘
-     │
-     ├──────────────────────┬──────────────────────┐
-     ▼                      ▼                      ▼
-  策略训练              [04] 真机回放           [05] 仿真回放
-  (LeRobot)         04_replay_on_arm.py     05_replay_in_sim.py
-                    SO-ARM 101 + IK         MuJoCo + same-source MJCF
+[录制层 — iPhone Pro]                    [执行层 — recording-agnostic]
+
+(iPhone) .r3d → 01 → 02 → 03_source.lerobot
+                  ↓
+               .processed.npz                 retarget/                  replay/
+                  └──────→ ──────→  (per-robot+env)  ──→  (per-robot+env)
+                                    so101 / shadow / leap     mujoco / rerun / real
+                                    python -m retarget         python -m replay
+                                    → .qpos.npz                → viewer / .mp4 / 真臂
 ```
 
-| 步骤 | 输入 | 输出 | 关键能力 |
+### 1.1 录制层（iPhone Pro）
+
+| 步骤 | 输入 / 输出 | 说明 |
+|:---|:---|:---|
+| 01 | `.r3d` → `01_hand_track.py` → `01_tracking/<sid>/<sid>.tracking.npz` | HaMeR cam-frame 跟踪（双手 21 关节 + 6DoF） |
+| 02 | `02_process.py` → `02_processed/<sid>/<sid>.processed.npz` | trim + quality 门控（**不改信号值**） |
+| 03 | `03_build_source.py` → `03_source/` | LeRobot v3 数据集（**交付物**） |
+
+**raw-first 原则**：02_process 只做 trim + quality 门控，**不修改任何信号值**（不填 NaN、不滤波、不平滑）。所有可选处理推到下游。这与 DexYCB / HumanPlus / DROID 等业界标杆数据集的发布范式一致。
+
+### 1.2 执行层（recording-agnostic）
+
+| 步骤 | 输入 | 输出 | 说明 |
 |:---|:---|:---|:---|
-| 01 | `.r3d` 目录 | `01_tracking/*.pkl` | HaMeR 裸手 6DoF 检测，MediaPipe bbox 先验，LiDAR 深度透视修正 |
-| 02 | 01 pkl | `02_processed/*.pkl` | ARKit 世界系变换，robust anchor，质量门控，NaN 插值，One-Euro 滤波 |
-| 03 | 02 pkl + `.r3d` | `03_dataset_v3/` | 流式读 r3d → resize → LeRobot v3 打包；可选 `--sim-check` 触发 05 烟测 |
-| 04 | 03 数据集 | 真机动作 | retarget → IK（wrist sub-chain）→ wrist_roll anchor → SafeHome |
-| 05 | 03 数据集 | MuJoCo 窗口 / headless | same-source URDF+MJCF，`ctrl = IK 解`，`qpos = 原始 dataset`（双写） |
+| 05 retarget | `.processed.npz`（schema 校验决定，不绑文件名前缀） | `output/<line>/<batch>/05_qpos_<robot>/<sid>/<sid>.qpos.npz` + `.qpos.meta.json` | `python -m retarget --robot <r> --hand <h>`；conda env 视后端而定（dex 后端要 `opc-dex`） |
+| 06 replay | `.qpos.npz` + meta | viewer 窗口 / `06_replay_<robot>/<sid>/<sid>.replay.mp4` / 真臂 | `python -m replay --qpos-root ... --output viewer\|mp4\|real`；后端从 meta 读 `(robot, env)` 自动派发 |
+
+**执行层零代码改动地新增能力**：retarget 通过 schema 校验（不绑定文件名前缀）自动接受合规 `.npz` 输入；NaN 太多会失败并提示先做平滑。replay 只灌 qpos 给 MuJoCo / 真臂。客户交付的 per-embodiment LeRobot v3（含 state/action）放 `0X_build_<robot>`（task #22 待开发）。
 
 详细技术文档：
-- **[docs/HaMeR_Pipeline_Guide.md](docs/HaMeR_Pipeline_Guide.md)** — 01 → 04 主线全栈
-- **[docs/Sim_Replay_Guide.md](docs/Sim_Replay_Guide.md)** — 05 仿真回放 + sim-check 集成
 - **[docs/keywords.md](docs/keywords.md)** — 术语速查
+- **[docs/HaMeR_Pipeline_Guide.md](docs/HaMeR_Pipeline_Guide.md)** — iPhone 路线技术细节
+- **[docs/Sim_Replay_Guide.md](docs/Sim_Replay_Guide.md)** — sim 集成
 
 ---
 
-## 2. 环境配置
+**iPhone-line 注释**：iPhone 多一列 ARKit `T_world_cam` per-frame 外参（透传到 03_source 的 LeRobot feature 列），下游可重建任意坐标系。
 
-### 2.1 依赖 & Python
+**SO-101 后端**（`retarget/so101.py` + `replay/sim/mujoco_so101.py` + `replay/real/so101.py`）已就绪。`python -m retarget --robot so101 --hand right` 跑 IK + wrist_roll 反解 + thumb-index 夹爪映射，输出 `.qpos.npz` (radians)；`python -m replay --output {viewer,mp4,real}` 派发到 sim viewer / 离屏 mp4 / SO-101 真臂三选一。**dex hands 后端**（Shadow / Leap / Allegro 等）`python -m retarget --robot shadow` + `python -m replay` 走 mujoco_dex / rerun_dex。
 
-- Python **3.10+**（推荐 miniconda `lerobot` env，Python 3.12）
-- 核心：`numpy`, `opencv-contrib-python`, `scipy`, `pandas`, `pyarrow`
-- 管线：`ikpy`（IK）、`lerobot`（数据集 + SO100Follower 驱动）、`record3d`、`pyliblzfse`（LiDAR LZFSE 解压）
-- 感知：`torch`, `detectron2`, `smplx`, `timm`, `pytorch-lightning`（HaMeR），`mediapipe`
-- 仿真：`mujoco`（≥ 3.x）
+---
 
-```bash
-# 推荐使用 lerobot 预置环境
-conda activate lerobot
-pip install ikpy record3d pyliblzfse mediapipe mujoco
-# HaMeR 依赖（torch、detectron2 请按官方说明匹配 CUDA 版本）
-```
+## 2. 环境
 
-### 2.2 资产下载
-
-| 资产 | 路径 | 获取方式 |
+| Conda env | 用途 | 关键依赖 |
 |:---|:---|:---|
-| SO-ARM 101 URDF | `assets/so101_new_calib.urdf` | ✅ 仓库自带（Apache-2.0） |
-| SO-ARM 101 MJCF | `assets/mujoco/trs_so101/` | ✅ 仓库自带（Apache-2.0，同源于 URDF） |
-| MediaPipe hand_landmarker | `assets/mediapipe/hand_landmarker.task` | ✅ 仓库自带 |
-| HaMeR 模型权重 + MANO | `assets/hamer/_DATA/` | ⚠️ 需单独下载（~2GB） |
+| `lerobot` | 主环境（01-03 + so101 retarget + sim 回放） | `numpy`, `lerobot`, `mujoco`, `mink`, HaMeR 全家桶 |
+| `opc-dex` | dex hands retarget 步骤（独立） | `dex_retargeting`, `pinocchio`（与 `lerobot` 的 numpy ABI 冲突，故隔离） |
 
 ```bash
-# 下载 HaMeR 权重
+conda activate lerobot
+pip install -e .   # （仓库还未 packaging，按需安装）
+```
+
+### 2.1 资产下载
+
+```bash
+# HaMeR 权重（~3.4GB）
 python scripts/_download_hamer.py
-
-# 验证环境
 python scripts/_verify_hamer_env.py
+
+# MuJoCo Menagerie（Shadow Hand 等 MJCF；submodule）
+git submodule update --init --recursive
+
+# dex_retargeting 配套 URDF（dex hands 后端必需，~80MB）
+git clone https://github.com/dexsuite/dex-urdf.git assets/dex-urdf
 ```
-
-### 2.3 数据准备
-
-把 Record3D 导出的 `.r3d` 文件放进 `data/` 目录（`data/` 已 gitignore）：
-
-```
-data/
-├── raw/
-│   ├── 2026-04-15--episode-00.r3d
-│   ├── 2026-04-15--episode-01.r3d
-│   └── ...
-```
-
-### 2.4 硬件（可选）
-
-| 设备 | 用途 |
-|:---|:---|
-| iPhone 15 Pro（带 LiDAR） | 60fps RGB-D 采集，ARKit VIO 提供 `T_world_cam` |
-| SO-ARM 101 | 5-DoF + 夹爪真机回放目标（04 阶段） |
-
-无硬件也可跑：01/02/03 + 05（仿真）完整闭环。
 
 ---
 
-## 3. 快速上手（一条完整链路）
-
-以下命令假定工作目录为仓库根 `hand-6dof-pipeline/`，使用 `data/raw/*.r3d` 作为原始数据：
+## 3. 快速上手（iPhone Pro）
 
 ```bash
-# --- Step 1/4  感知（cam-frame，HaMeR + MediaPipe + LiDAR） ---
-python scripts/01_hand_track.py \
-    --r3d-dir ./data/raw \
-    --output output/01_tracking/tracking.pkl
+conda activate lerobot
+cd code/opc_data_pipeline
 
-# --- Step 2/4  处理（world-frame + 质量门控 + 滤波） ---
+# Step 1: HaMeR 跟踪（默认输入 output/iphone/<batch>/00_record/，输出 01_tracking/）
+python scripts/01_hand_track.py --r3d-dir output/iphone/<batch>/00_record/
+
+# Step 2: trim + quality
 python scripts/02_process.py \
-    --input output/01_tracking/tracking.pkl \
-    --output output/02_processed/processed.pkl
+    --track output/iphone/<batch>/01_tracking/<sid>/<sid>.tracking.npz
 
-# --- Step 3/4  打包 LeRobot v3（可选 sim-check 烟测） ---
-python scripts/03_build_dataset.py \
-    --processed output/02_processed/processed.pkl \
-    --r3d-dir ./data/raw \
-    --output-dir output/03_dataset_v3 \
-    --repo-id <user>/demo_v3 \
-    --task "pick up cup" \
-    --hand right \
-    --sim-check --sim-check-episodes 3 --sim-check-scale 0.5
-
-# --- Step 4a  真机回放（SO-ARM 101） ---
-python scripts/04_replay_on_arm.py \
-    --robot so101 --port COM5 \
-    --dataset-root output/03_dataset_v3 \
-    --episode 0 --speed 0.3 --scale 0.5 --flip-lateral
-
-# --- Step 4b  仿真回放（MuJoCo） ---
-python scripts/05_replay_in_sim.py \
-    --dataset-root output/03_dataset_v3 \
-    --episode 0 --scale 0.5
+# Step 3: 打 LeRobot v3 数据集（交付物）
+python scripts/03_build_source.py \
+    --repo-id opc/iphone_source_v1 --task pour_coffee_bean
 ```
 
-`--sim-check` 在 03 打包结束后自动调起 05 做前 N 集 headless 烟测——只要 IK + MJCF 能解出姿态、无数值爆炸，就通过；不通过会在 stderr 给出具体 episode / frame。
+**SO-arm 101 路径**（单一 `lerobot` env 即可）：
+
+```bash
+conda activate lerobot
+
+# Step 5: retarget
+python -m retarget --robot so101 --hand right \
+    --source-root output/iphone/<batch>/02_processed
+# 输出 → output/iphone/<batch>/05_qpos_so101/<sid>/<sid>.qpos.npz
+
+# Step 6a: sim 预览 (mp4 / viewer / rerun)
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_so101 --output mp4
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_so101            # viewer
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_so101 --output rerun
+
+# Step 6b: 真臂回放
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_so101 \
+    --output real --port COM5 --speed 0.3
+# 加 --dry-run 预跑（不连串口）
+```
+
+**Dex hands 路径**（Shadow Hand / Leap / Allegro 等）：
+
+```bash
+# Step 5: retarget — opc-dex env (numpy>=2 + dex_retargeting)
+conda activate opc-dex
+python -m retarget --robot shadow --hand right \
+    --source-root output/iphone/<batch>/02_processed
+# 输出 → output/iphone/<batch>/05_qpos_shadow/<sid>/<sid>.qpos.npz
+
+# Step 6: replay — lerobot env (mujoco)
+conda activate lerobot
+python -m replay --qpos-root output/iphone/<batch>/05_qpos_shadow
+```
 
 ---
 
 ## 4. 仓库布局
 
 ```
-hand-6dof-pipeline/
-├── README.md                     本文件
-├── LICENSE_THIRD_PARTY.md        第三方资产来源 & license 汇总
+opc_data_pipeline/
+├── README.md                    本文件
+├── LICENSE / LICENSE_THIRD_PARTY.md
 │
-├── docs/                         技术文档（主线）
-│   ├── HaMeR_Pipeline_Guide.md       01→04 全栈
-│   ├── Sim_Replay_Guide.md           05 + sim-check
-│   └── keywords.md                   术语速查
+├── docs/                        技术文档
+│   ├── keywords.md                  术语速查
+│   ├── HaMeR_Pipeline_Guide.md      iPhone 路线技术细节
+│   └── Sim_Replay_Guide.md          sim 集成
 │
-├── assets/                       模型权重 / URDF / MJCF
-│   ├── so101_new_calib.urdf          IK 用
-│   ├── mujoco/trs_so101/             MJCF + scene.xml（05 用，同源于 URDF）
-│   ├── hamer/                        HaMeR 权重（需单独下载）
-│   └── mediapipe/                    hand_landmarker.task
+├── assets/                      模型权重 / URDF / MJCF
+│   ├── hamer/                       HaMeR 权重（gitignored，需下载）
+│   ├── mediapipe/                   MediaPipe hand_landmarker.task
+│   ├── menagerie/                   MuJoCo Menagerie（submodule，Shadow Hand 等 MJCF）
+│   ├── dex-urdf/                    dex_retargeting 配套 URDF（gitignored，需 clone）
+│   ├── mujoco/trs_so101/            SO-ARM 101 MJCF
+│   └── so101_new_calib.urdf         SO-ARM 101 URDF
 │
-├── scripts/                      可执行入口
-│   ├── 01_hand_track.py              Step 1/4 感知
-│   ├── 02_process.py                 Step 2/4 处理
-│   ├── 03_build_dataset.py           Step 3/4 打包（± sim-check）
-│   ├── 04_replay_on_arm.py           Step 4/4 真机回放
-│   ├── 05_replay_in_sim.py           仿真回放（验证 04 解）
-│   ├── _download_hamer.py            HaMeR 权重下载
-│   └── _verify_hamer_env.py          环境自检
+├── scripts/                     iPhone-line 录制层 (stages 01-03)
+│   ├── 01_hand_track.py / 02_process.py / 03_build_source.py
+│   ├── _schema.py / _download_hamer.py / _verify_hamer_env.py
+│   └── legacy/
 │
-├── robots/                       机械臂驱动层
-│   ├── base.py                       RobotArm 抽象接口
-│   └── so101.py                      SO-ARM 101（LeRobot SO100Follower 封装）
+├── utils/                       共用工具
+│   ├── common/                      pose_util.py / geometry.py（数学）
+│   ├── hand_tracker/                HaMeR + MediaPipe + depth_correction
+│   │                                + spatial_tracker + io + overlay
+│   ├── iphone/                      r3d_reader.py（.r3d 解码）
+│   ├── process/                     core.py — trim + quality + 旋转诊断
+│   │                                world_frame.py — ARKit 外参 → world frame
+│   └── dataset/                     core.py + iphone_writer
+│                                    LeRobot v3 写入封装
 │
-├── sim/                          仿真层
-│   ├── mujoco_loader.py              MJCF 加载 + LeRobot joint-name 映射
-│   └── mujoco_replay.py              ctrl/qpos 双写 + viewer 循环
+├── retarget/                    执行层 stage 5 — recording-agnostic
+│   ├── __init__.py                  注册表 + (robot, env) 派发
+│   ├── __main__.py                  CLI: python -m retarget
+│   ├── loader.py                    任意 .npz schema 校验 + 加载
+│   ├── dex_hands.py                 dex_retargeting 后端 (shadow/leap/...)
+│   └── so101.py                     SO-arm 101 后端（mink IK + pinch midpoint + 夹爪）
 │
-├── utils/                        共享工具
-│   ├── r3d_reader.py                 .r3d 流式读取 + ARKit 位姿
-│   ├── hand_tracker/                 HandDetectorBase + HaMeR + MediaPipe
-│   ├── depth_correction.py           LiDAR 透视修正
-│   ├── interpolation.py              NaN 补帧 + Slerp
-│   ├── one_euro_filter.py            One-Euro 时序滤波（Pos + Slerp-Rot）
-│   ├── spatial_tracker.py            MediaPipe 左右手翻转纠正
-│   ├── pose_util.py                  pose ↔ mat ↔ rot6d
-│   └── safe_home.py                  断连前回零安全上下文
+├── replay/                      执行层 stage 6 — recording-agnostic
+│   ├── __init__.py                  注册表 + (robot, env) 派发
+│   ├── __main__.py                  CLI: python -m replay
+│   ├── sim/
+│   │   ├── mujoco_loader.py         SO-101 MJCF 加载
+│   │   ├── mujoco_mesh.py           可视 mesh 提取（rerun 共用）
+│   │   ├── mujoco_dex.py            dex hand sim 后端（mp4 / viewer）
+│   │   ├── mujoco_so101.py          SO-101 sim 后端（mp4 / viewer）
+│   │   ├── rerun_dex.py             dex hand rerun.io AR-overlay 后端
+│   │   ├── rerun_so101.py           SO-101 rerun.io AR-overlay 后端
+│   │   └── scenes/                  生成的 MJCF（gitignored）
+│   └── real/
+│       └── so101.py                 SO-101 真臂后端（含驱动 + SafeHome）
 │
-├── tests/                        pytest 主线
-│   ├── test_hand_track.py / test_process.py / test_build_dataset.py
-│   ├── test_replay_on_arm.py（含 IK + compute_T_arm_world + wrist_roll）
-│   ├── test_sim_replay.py
-│   └── test_r3d_reader / test_interpolation / test_one_euro_filter /
-│       test_depth_correction / test_pose_util / test_hand_tracker /
-│       test_spatial_tracker
+├── tests/                       pytest
 │
-└── output/                       运行产出（内容已 gitignore，目录保留）
-    ├── 01_tracking/                  01 输出 pkl
-    ├── 02_processed/                 02 输出 pkl
-    ├── 03_dataset_v3/                03 输出 LeRobot v3
-    └── replay_start.json             04 使用的 IK-友好初始姿态
+└── output/                      运行产出（gitignored，目录保留）
+    └── iphone/<batch>/
+        ├── 00_record/ 01_tracking/ 02_processed/ 03_source/
+        ├── 05_qpos_<robot>/<sid>/    qpos.npz + qpos.meta.json
+        └── 06_replay_<robot>/<sid>/  replay.mp4
 ```
+
+**Batch-major 布局**：每个 capture campaign（如 `pour_coffee_bean_4_30`）一个根目录，下面有完整 stages 产物。打包/归档/删除/对比都以 batch 为单元。脚本 `--batch <name>` 可显式指定，多数情况能从输入路径自动派生。
+
+**Stage 编号**：01-03 是录制层（per-line），05-06 是执行层（per-robot+env，公共）。`05_qpos_<robot>` / `06_replay_<robot>` 结构一致；其中 robot 来自 retarget CLI 的 `--robot`。客户交付的 per-embodiment LeRobot v3（带 retarget 输出 + state/action）将作为 `0X_build_<robot>` 在录制层并存（task #22 待开发）。
 
 ---
 
-## 5. 关键设计决策（速览）
+## 5. 输出数据集结构（LeRobot v3）
 
-### 5.1 `wrist_flex` 作为 dataset 锚点（不是 gripper_frame）
-
-Dataset 的 `eef_pos` 对齐 HaMeR 手腕关键点（= 机械臂 **wrist_flex** 关节），不是 gripper_frame（再向外 ~10cm 的工具末端）。
-
-- 02 用首 N 帧 wrist 中位数做 robust anchor（抗首帧抖动）
-- 04 IK 跑 wrist sub-chain（截断到 wrist_flex），world 原点 = replay_start 时的 wrist_flex 位置
-- `auto_placement_from_home` 用 FK 自动算 `(distance, table_height)`，无需额外标定文件
-
-### 5.2 世界系映射与 flip
-
-ARKit 世界系：+Y 重力朝上。SO-ARM 101 base：+X 前、+Y 左、+Z 上。
-
-变换链：`R_arm_world = Rz(rotate_deg) @ Rx(90°) @ M_flip`
-
-- `--flip`：对称 world X（右手采集 → 左手工作空间复用）
-- `--flip-lateral`：对称 world Z（采集方向 / 部署方向左右相反时用，`det(R) = -1`）
-
-### 5.3 wrist_roll anchor（Option A）
-
-HaMeR 全局方向不完美对齐机械臂，轴 5 绝对角易漂移。04 只锚首帧：
-
-```
-delta = replay_start.wrist_roll − extracted_wrist_roll[0]
-wrist_roll_t += delta   # for all t
-```
-
-保持帧间相对旋转，首帧贴齐 replay_start，后续自然演化。
-
-### 5.4 replay_start vs SafeHome
-
-- **SafeHome**：连接时记录"上电安全姿态"，退出自动回到（关节紧凑、重心低）
-- **replay_start**（外部 JSON）：独立"IK-友好展开姿态"，每次 episode 开始前从 safe → replay_start
-
-两者解耦后，安全姿态可独立于 IK 起点。
-
-### 5.5 LiDAR 深度透视修正
-
-HaMeR 单目估计 z 精度差（焦距虚拟值 5000）。iPhone LiDAR 提供真实深度：
-
-```
-scale = z_lidar / z_hamer
-corrected = [x_hamer * scale, y_hamer * scale, z_lidar]
-```
-
-所有 3D 数据（wrist + 21 joints）同步缩放，`eef_rot` 不变（射线方向本身准）。
-
-### 5.6 same-source URDF + MJCF
-
-`so101_new_calib.urdf` 和 `assets/mujoco/trs_so101/so101_new_calib.xml` 都是由同一份 Onshape CAD 经 onshape-to-robot 同时生成，**零点、轴向、关节名完全一致**。所以 04（ikpy + URDF）解出的 joint 角可以直接喂给 05（MuJoCo + MJCF）的 `mjData.ctrl`，不需要 per-joint offset。
-
----
-
-## 6. 输出数据集结构（LeRobot v3）
+### 5.1 Source 数据集（`iphone/<batch>/03_source/`）—— 交付物
 
 | Feature | dtype | shape | 说明 |
 |:---|:---|:---|:---|
 | `observation.images.rgb` | video | (480, 640, 3) | MP4 (AV1) |
-| `observation.images.depth` | video | (480, 640, 3) | 可选，LiDAR uint8 cm |
-| `observation.state` | float32 | (7,) | `[x, y, z, rx, ry, rz, gripper]`（episode-local world） |
-| `action` | float32 | (7,) | `state[t+1]`，绝对位姿 |
+| `observation.depth` | uint16 | (480, 640) | **无损 mm 量纲**（Array2D，0..65535 mm）。可选 `--depth-encoding uint8_cm` 降级（120× 节省存储，截断 2.55 m） |
+| `observation.wrist_pose_left/right` | float32 | (7,) | xyz + scipy xyzw quat，cam frame |
+| `observation.mano_joints_left/right` | float32 | (21, 3) | MANO 21 关键点 cam frame |
+| `observation.left/right_valid` | float32 | (1,) | 1.0 = 该帧有效（trim 内 + quality 过 + finite） |
+| `observation.left/right_confidence` | float32 | (1,) | HaMeR 检测器原始置信度 |
+| `observation.T_world_cam` | float32 | (4, 4) | ARKit per-frame 外参，下游可重建任意坐标系 |
 
-Per-episode 元数据附加 `center_offset_world`（episode 原点在 ARKit 绝对世界系的位置），下游可恢复全局坐标。
+**没有 `observation.state` / `action`**——那是下游 per-embodiment 数据集的工作。Source 数据集只发"裸手观测"，机器人侧动作交给客户 / 下游脚本组装。
 
----
+### 5.2 Per-embodiment 客户交付数据集（`<line>/<batch>/0X_build_<robot>/`，task #22 待开发）
 
-## 7. 测试
+下一轮要重建的客户交付层。预期 schema（参考 LeRobot 训练 SDK）：
 
-```bash
-# 主线测试（legacy 默认已在 conftest 排除）
-pytest tests/ -v
+| Feature | dtype | shape | 说明 |
+|:---|:---|:---|:---|
+| `observation.images.rgb` | video | (H, W, 3) | passthrough |
+| `observation.depth` | uint16 | (H, W) | passthrough |
+| `observation.state` | float32 | (N,) | embodiment-specific（SO-101 = 7：xyz + rx ry rz + gripper） |
+| `action` | float32 | (N,) | 同上；`action[t] = state[t+1]` |
+| `observation.qpos` | float32 | (N_qpos,) | retarget 输出 qpos（来自 `05_qpos_<robot>`） |
 
-# 单模块
-pytest tests/test_replay_on_arm.py -v
-pytest tests/test_sim_replay.py -v
+数据流：`03_source` → 平滑/插值/gripper 归一化 → 拼 state/action → 拉 `05_qpos_<robot>` 的 qpos 列 → LeRobot v3 写盘。
+
+### 5.3 中间产物：`05_qpos_<robot>/`（执行层，非交付）
+
+`python -m retarget` 输出。**内部 QA 链路用**，不交付客户：
+
+```
+<sid>.qpos.npz:
+  timestamps_us  (T,)    int64
+  <hand>_qpos    (T, N)  float32   # NaN 在无效帧
+  <hand>_qpos_valid (T,) bool
+
+<sid>.qpos.meta.json:
+  robot, env, hand, joint_names, n_joints,
+  trim, n_frames_total / _in_trim / _retarget_succeeded,
+  K_flat (intrinsics), backend, schema_version, run_timestamp_iso
 ```
 
 ---
 
-## 8. Limitations
+## 6. 测试
 
-诚实说明当前阶段的边界。这些不是 bug，是 scope 选择——后续会逐项推进。
-
-### 数据 / 规模
-- **单视角**：只测过 iPhone LiDAR 俯拍桌面场景；多视角融合未实现
-- **小样本**：目前验证集 ~835 帧（3 episodes），尚未发布公开数据集（计划 W6+ Orbbec 头戴采集满 5h 后发 v1）
-- **硬件依赖**：depth back-projection 路径依赖 iPhone LiDAR；无深度传感器的设备只能跑 HaMeR 虚拟深度（精度显著下降，见 §5.5）
-
-### 方法 / 精度
-- **动作复现 ≠ 动作推理**：当前 pipeline 把人手轨迹映射并回放到机械臂，**不是学习 policy**。下游策略训练（DP / ACT）只跑过教学级验证，非 production
-- **wrist_roll Option A 简化**：首帧锚定 + 保留相对旋转，未实现完整 SO(3) orientation anchor。对大方向跟踪够用，精细操作（threading / insertion）可能不够
-- **retarget 仅测过 SO-ARM 101**：其他形态机器人（7-DoF / 双臂 / 灵巧手）需重新适配 IK chain 和 wrist 对应
-
-### 许可证
-- **MANO 非商用**：HaMeR 依赖 MANO 模型，MANO 官方 license 仅限学术 / 非商用。商用需联系 MPI 另行授权，详见 [LICENSE_THIRD_PARTY.md](LICENSE_THIRD_PARTY.md)
-
-### 工程 / 平台
-- **Windows multiprocessing 未解**：L2 训练在 Windows 下需 `if __name__ == '__main__'` guard，当前脚本未完整适配，推荐在 Linux / WSL 跑训练
-- **work-in-progress**：单人开发，API 可能迭代。Breaking change 会在 CHANGELOG 说明，但不保证向后兼容（Phase 0）
-
-### 不做什么
-- 不追求 SOTA 精度，追求**可复现 + 可扩展**
-- 不造轮子，依赖成熟组件（HaMeR / MediaPipe / LeRobot / ikpy）
-- 不做 GUI 工具链，一切 CLI + 文档
-
-欢迎 issue 拍砖 · 具体场景不确定能不能用，开 Discussion 一起看。
+```bash
+pytest tests/ -v
+```
 
 ---
 
-## 9. License
+## 7. License
 
-- 本仓库代码：[MIT](LICENSE)
+- 仓库代码：[MIT](LICENSE)
 - 第三方资产（URDF / MJCF / HaMeR / MANO / MediaPipe）：见 [LICENSE_THIRD_PARTY.md](LICENSE_THIRD_PARTY.md)
+- **MANO 非商用**：HaMeR 依赖 MANO，MANO license 仅限学术 / 非商用，商用需联系 MPI 另行授权

@@ -1,523 +1,562 @@
 """
-World-frame processing of cam-frame tracking data.
+Per-r3d tracking-data cleanup → cam-frame .processed.npz (raw-first).
 
-Pipeline position: Step 2/4 (processing layer)
-Input:  Dual-hand cam-frame tracking pickle from 01_hand_track.py
-        (coord_frame='camera'; wrist/rot/joints in cam frame; raw)
-Output: Dual-hand episode-local world-frame tracking pickle consumed by 03
-        (coord_frame='episode_local'; per-hand state/action; trimmed per hand)
+Pipeline position: Step 2/6 (iPhone-line) — processing layer.
+Input:  output/iphone/01_tracking/<sid>/<sid>.tracking.npz   (cam-frame raw HaMeR)
+Output: output/iphone/02_processed/<sid>/
+        ├── <sid>.processed.npz             cleaned per-hand arrays
+        └── <sid>.processed.meta.json       per-hand stats + filter params
 
-Per-hand pipeline (hands processed independently — each has own trim window):
-  [1] trim leading/trailing NaN   → records trim_slice (into original r3d range)
-  [2] world transform             → p_world = R_wc @ p_cam + t_wc
-                                    R_hand_world = R_wc @ R_hand_cam
-  [3] center to robust anchor     → subtract median of first N valid wrists
-                                    (3 axes); records center_offset_world
-  [4] mark bad frames             → position jumps > max_pos_jump_m → NaN
-  [5] quality check               → detection rate / max gap / duration
-  [6] fill interior NaN           → linear + Slerp via PoseInterpolator
-  [7] One-Euro filter             → pos (VectorOneEuro) + rot (slerp-OneEuro)
-  [8] rotation jump warning       → log if frame-to-frame angle > threshold
-  [9] gripper normalize           → (gw - min) / (max - min), clip [0, 1]
- [10] build state/action          → 7D absolute, action[t] = state[t+1]
+Per-hand pipeline (utils/process/iphone.py — mirror of utils/process/orbbec.py):
+  trim → quality_check → rotation_jump_diagnostic
+  Raw-first: no signal modification (no fill, no smooth, no world transform).
+  NaN frames within trim are preserved. Downstream (03_build_source /
+  04_build_so101) decides how to handle them.
 
-Output schema (one dict per episode):
-  {
-      "timestamps":   (T_full,)      float64   # full (untrimmed) episode
-      "T_world_cam":  (T_full, 4, 4) float64   # ARKit pose, untrimmed
-      "K":            (3, 3)         float64
-      "left_hand": {
-          # Post-processing arrays, length T_trim_left:
-          "state":              (T_trim, 7)   float32  # [x,y,z,rx,ry,rz,g]
-          "action":             (T_trim, 7)   float32  # action[t]=state[t+1]
-          "wrist_world":        (T_trim, 3)   float64
-          "wrist_rot_world":    (T_trim, 3)   float64  # axis-angle
-          "gripper_normalized": (T_trim,)     float32  # in [0, 1]
-          "joints_cam":         (T_trim,21,3) float64  # passthrough cam frame
-          "confidence":         (T_trim,)     float64
-          # Metadata:
-          "trim_slice":          (first, last)           # into full r3d range
-          "center_offset_world": (3,)         float64    # episode origin in world
-          "quality_passed":      bool
-          "skip_reason":         str
-      },
-      "right_hand":   {same fields},
-      "source":       str
-      "episode_name": str
-      "coord_frame":  "episode_local"                     # contract marker for 03
-  }
+Conversion: axis-angle wrist_rot_cam (HaMeR native, from 01) → xyzw quat
+with hemisphere continuity (q[t]·q[t-1] >= 0). Matches 335 schema. Wrist
+smoothing lives in `optimize/` — run `python -m optimize ...` to apply
+One-Euro / interp etc. on top of the raw `.processed.npz` output.
+
+Schema v2 (npz fields, T = same length as input tracking):
+  timestamps_us               (T,)     int64
+  K                           (3, 3)   float64
+  T_world_cam                 (T, 4, 4) float64   ARKit per-frame poses (passthrough)
+  source                      str
+  episode_name                str
+
+  Per-hand cam-frame (v1, kept for backward compat with retarget/loader.py):
+    <hand>_wrist_cam          (T, 3)   float64
+    <hand>_wrist_quat_cam     (T, 4)   float64   scipy xyzw, hemisphere-continuous
+    <hand>_joints_cam         (T,21,3) float64   raw HaMeR joints (NaN at gaps)
+    <hand>_bbox               (T, 4)   float64   MediaPipe detector bbox
+    <hand>_confidence         (T,)     float64
+
+  Per-hand world-frame (v2, derived via cam→world using T_world_cam):
+    <hand>_wrist_world        (T, 3)   float64   wrist position in ARKit world
+    <hand>_wrist_quat_world   (T, 4)   float64   wrist orientation in ARKit world
+    <hand>_joints_world       (T,21,3) float64   MANO 21 joints in ARKit world
+    <hand>_gripper            (T,)     float64   [0=closed,1=open] from thumb↔index dist
+
+  Per-hand flags:
+    <hand>_trim_first         int32    inclusive start into original T
+    <hand>_trim_last          int32    exclusive stop into original T
+    <hand>_quality_passed     bool     True iff trim+quality both passed
 
 Usage:
-    python 02_process.py --input tracking.pkl --output processed.pkl
-    python 02_process.py --input tracking.pkl --output processed.pkl --no-filter
+    conda activate lerobot
+    cd code/opc_data_pipeline
+
+    # Single tracking npz
+    python scripts/02_process.py --track output/iphone/01_tracking/<sid>/<sid>.tracking.npz
+
+    # All tracking npz under a directory
+    python scripts/02_process.py --track-dir output/iphone/01_tracking/
 """
 
+from __future__ import annotations
+
 import argparse
-import pickle
+import json
 import sys
-from dataclasses import dataclass
+import time
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-from utils.interpolation import (
-    fill_tracking_result,
-    mark_bad_frames,
-    max_consecutive_nans,
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+from utils.process.core import ProcessConfig, process_hand           # noqa: E402
+from utils.process.world_frame import (                              # noqa: E402
+    transform_points_cam_to_world,
+    transform_quats_cam_to_world,
 )
-from utils.one_euro_filter import PoseOneEuroFilter
+from utils.hand_tracker.preview_from_npz import (                    # noqa: E402
+    render_preview_from_npz,
+)
+
+from scripts._schema import HAND_FIELDS                              # noqa: E402
 
 
-# =============================================================================
-# 1. Config
-# =============================================================================
+# v2 derived fields appended to per-hand output (in addition to HAND_FIELDS):
+#   wrist_world / wrist_quat_world / joints_world: cam-frame fields lifted
+#   into ARKit world frame using per-frame T_world_cam (gravity-aligned).
+#   gripper: scalar [0, 1] open value derived from MANO thumb-tip ↔ index-tip
+#   distance (rigid-invariant, computed once here so downstream doesn't repeat).
+HAND_FIELDS_V2 = (
+    "wrist_world",
+    "wrist_quat_world",
+    "joints_world",
+    "gripper",
+)
 
-@dataclass
-class ProcessConfig:
-    """Processing parameters.
-
-    Attributes:
-        fps: Capture rate (used for duration check).
-        min_detect_rate: Minimum fraction of valid frames; below → reject.
-        max_consecutive_gap: Longest interior NaN run allowed; above → reject.
-        max_pos_jump_m: Per-frame position jump above this marks a bad frame.
-        min_duration_s: Minimum valid-frame duration (s) for the hand to pass.
-        filter_min_cutoff: One-Euro min cutoff (Hz). Lower = more smoothing.
-        filter_beta: One-Euro speed coefficient.
-        rot_jump_warn_deg: Log warning for frame-to-frame rotation > this.
-        enable_filter: Toggle One-Euro smoothing.
-        anchor_window_n: Number of leading valid frames used to compute the
-            episode origin via per-axis median. Robust to single-frame LiDAR
-            outliers at the trim boundary.
-    """
-    fps: int = 60
-    min_detect_rate: float = 0.5
-    max_consecutive_gap: int = 30
-    max_pos_jump_m: float = 0.05
-    min_duration_s: float = 2.0
-    filter_min_cutoff: float = 1.0
-    filter_beta: float = 0.007
-    rot_jump_warn_deg: float = 45.0
-    enable_filter: bool = True
-    anchor_window_n: int = 10
+# MANO joint indices for gripper derivation (matches retarget/so101.py).
+_MANO_THUMB_TIP_IDX = 4
+_MANO_INDEX_TIP_IDX = 8
+# Linear range mapping thumb-index distance → gripper [0, 1].
+_GRIPPER_OPEN_M = 0.10    # ≥ 10 cm → fully open (1.0)
+_GRIPPER_CLOSE_M = 0.02   # ≤  2 cm → fully closed (0.0)
 
 
-# =============================================================================
-# 2. Input validation
-# =============================================================================
+def _compute_world_fields(
+    cam_hand: dict,
+    T_world_cam_slice: np.ndarray,
+) -> dict:
+    """Lift one trimmed cam-frame hand dict into world frame + add gripper.
 
-def _validate_input(tracking: dict, episode_name: str) -> None:
-    """Enforce the 01→02 contract: cam-frame dual-hand tracking."""
-    if tracking.get("coord_frame") != "camera":
-        raise ValueError(
-            f"{episode_name}: expected coord_frame='camera', got "
-            f"{tracking.get('coord_frame')!r}. Run 01_hand_track.py first."
-        )
-    if "left_hand" not in tracking or "right_hand" not in tracking:
-        raise ValueError(
-            f"{episode_name}: expected dual-hand format (left_hand, "
-            f"right_hand); got keys {sorted(tracking.keys())}"
-        )
-    for required in ("timestamps", "T_world_cam", "K"):
-        if required not in tracking:
-            raise ValueError(f"{episode_name}: missing top-level key {required!r}")
-
-
-def _extract_hand_cam(tracking: dict, hand: str) -> dict:
-    """Pull single-hand cam-frame dict from dual-hand input (deep copy)."""
-    h = tracking[f"{hand}_hand"]
-    return {
-        "timestamps":    tracking["timestamps"].copy(),
-        "T_world_cam":   tracking["T_world_cam"].copy(),
-        "wrist_cam":     h["wrist_cam"].copy(),
-        "wrist_rot_cam": h["wrist_rot_cam"].copy(),
-        "joints_cam":    h["joints_cam"].copy(),
-        "gripper_width": h["gripper_width"].copy(),
-        "confidence":    h["confidence"].copy(),
-    }
-
-
-# =============================================================================
-# 3. [1] Trim leading / trailing NaN
-# =============================================================================
-
-def trim_hand(hand_data: dict) -> tuple[dict, tuple[int, int]] | None:
-    """Slice all per-frame arrays to the [first_valid, last_valid+1] range.
-
-    Returns (trimmed_dict, (first, last)) or None if no valid frames exist.
-    All per-frame arrays (including T_world_cam, timestamps, joints_cam,
-    gripper_width, confidence) are sliced consistently so downstream steps
-    can assume every frame index is a legitimate hand-in-frame sample.
-    """
-    valid = ~np.isnan(hand_data["wrist_cam"][:, 0])
-    if not np.any(valid):
-        return None
-    idx = np.where(valid)[0]
-    first, last = int(idx[0]), int(idx[-1] + 1)  # slice end is exclusive
-    seg = slice(first, last)
-    trimmed = {
-        "timestamps":    hand_data["timestamps"][seg],
-        "T_world_cam":   hand_data["T_world_cam"][seg],
-        "wrist_cam":     hand_data["wrist_cam"][seg],
-        "wrist_rot_cam": hand_data["wrist_rot_cam"][seg],
-        "joints_cam":    hand_data["joints_cam"][seg],
-        "gripper_width": hand_data["gripper_width"][seg],
-        "confidence":    hand_data["confidence"][seg],
-    }
-    return trimmed, (first, last)
-
-
-# =============================================================================
-# 4. [2] World transform
-# =============================================================================
-
-def world_transform(hand_data: dict) -> dict:
-    """Transform wrist position + rotation from camera frame to ARKit world.
-
-    Math (per valid frame t):
-        p_world = R_wc @ p_cam + t_wc
-        R_hand_world = R_wc @ R_hand_cam      # stacking rotations
-        wrist_rot_world = Rodrigues^-1(R_hand_world)
-
-    joints_cam stays in cam frame (used for 2D observation overlay, not world
-    coordinates). This keeps the output compact and decouples the joints from
-    the episode-local centering applied later.
-
-    Adds keys:
-        eef_pos: (T, 3) wrist in world frame (NaN at no-detect frames)
-        eef_rot: (T, 3) axis-angle in world frame (NaN at no-detect frames)
-    """
-    T_wc = hand_data["T_world_cam"]          # (T, 4, 4)
-    wrist_cam = hand_data["wrist_cam"]       # (T, 3)
-    rot_cam = hand_data["wrist_rot_cam"]     # (T, 3) axis-angle
-    n = len(wrist_cam)
-
-    R_wc = T_wc[:, :3, :3]
-    t_wc = T_wc[:, :3, 3]
-
-    valid = ~np.isnan(wrist_cam[:, 0])
-    wrist_world = np.full_like(wrist_cam, np.nan, dtype=np.float64)
-    rot_world = np.full_like(rot_cam, np.nan, dtype=np.float64)
-
-    for t in range(n):
-        if not valid[t]:
-            continue
-        wrist_world[t] = R_wc[t] @ wrist_cam[t] + t_wc[t]
-        R_hand_cam = Rotation.from_rotvec(rot_cam[t]).as_matrix()
-        R_hand_world = R_wc[t] @ R_hand_cam
-        rot_world[t] = Rotation.from_matrix(R_hand_world).as_rotvec()
-
-    return {
-        **hand_data,
-        # "eef_pos"/"eef_rot" keys match what utils/interpolation.py expects
-        "eef_pos": wrist_world,
-        "eef_rot": rot_world,
-    }
-
-
-# =============================================================================
-# 5. [3] Center to robust anchor
-# =============================================================================
-
-def center_to_anchor(
-    hand_data: dict, window_n: int = 10,
-) -> tuple[dict, np.ndarray]:
-    """Shift eef_pos so the episode anchor sits at 0 (all 3 axes).
-
-    Anchor = per-axis median over the first `window_n` valid frames. Median
-    is immune to single-frame LiDAR outliers at the trim boundary (up to
-    window_n // 2 - 1 bad frames tolerated per axis).
-
-    joints_cam is NOT translated — it lives in cam frame, not world.
+    Args:
+        cam_hand: dict with cam-frame trimmed arrays (wrist_cam, wrist_quat_cam,
+            joints_cam, bbox, confidence). Output of process_hand.
+        T_world_cam_slice: (T_trimmed, 4, 4) per-frame extrinsics matching
+            the same trim window.
 
     Returns:
-        (hand_data_out, origin_world) — origin is the subtracted offset
-        (float64, shape (3,)). Downstream consumers can reconstruct absolute
-        world coordinates by adding origin_world back.
+        dict with HAND_FIELDS_V2 keys (wrist_world, wrist_quat_world,
+        joints_world, gripper). All NaN-propagating.
     """
-    pos = hand_data["eef_pos"]
-    valid = ~np.isnan(pos[:, 0])
-    if not np.any(valid):
-        return {**hand_data}, np.zeros(3, dtype=np.float64)
-
-    # First `window_n` valid frames → per-axis median anchor.
-    valid_idx = np.flatnonzero(valid)[:window_n]
-    origin = np.nanmedian(pos[valid_idx], axis=0).astype(np.float64)
-    new_pos = pos.copy()
-    new_pos[valid] = pos[valid] - origin
-    return {**hand_data, "eef_pos": new_pos}, origin
-
-
-# =============================================================================
-# 6. [5] Quality check
-# =============================================================================
-
-def quality_check(hand_data: dict, config: ProcessConfig) -> tuple[bool, str]:
-    """Return (passed, reason)."""
-    pos = hand_data["eef_pos"]
-    n_total = len(pos)
-    n_valid = int((~np.isnan(pos[:, 0])).sum())
-    detect_rate = n_valid / n_total if n_total else 0.0
-
-    if detect_rate < config.min_detect_rate:
-        return False, f"detection rate {detect_rate:.0%} < {config.min_detect_rate:.0%}"
-    max_gap = max_consecutive_nans(pos)
-    if max_gap > config.max_consecutive_gap:
-        return False, f"max gap {max_gap} > {config.max_consecutive_gap}"
-    valid_duration = n_valid / config.fps
-    if valid_duration < config.min_duration_s:
-        return False, f"valid duration {valid_duration:.1f}s < {config.min_duration_s}s"
-    return True, "ok"
-
-
-# =============================================================================
-# 7. [7] One-Euro filter
-# =============================================================================
-
-def apply_one_euro(hand_data: dict, config: ProcessConfig) -> dict:
-    """Per-frame One-Euro filter on 6DoF world-frame pose.
-
-    Input must be NaN-free (run after fill_tracking_result).
-    """
-    pos = hand_data["eef_pos"]
-    rot = hand_data["eef_rot"]
-    ts = hand_data["timestamps"]
-
-    filt = PoseOneEuroFilter(
-        min_cutoff=config.filter_min_cutoff,
-        beta=config.filter_beta,
+    wrist_world = transform_points_cam_to_world(
+        cam_hand["wrist_cam"], T_world_cam_slice,
     )
-    pos_out = np.empty_like(pos)
-    rot_out = np.empty_like(rot)
-    for t in range(len(pos)):
-        p_f, r_f = filt.filter(pos[t], rot[t], timestamp=float(ts[t]))
-        pos_out[t] = p_f
-        rot_out[t] = r_f
-    return {**hand_data, "eef_pos": pos_out, "eef_rot": rot_out}
-
-
-# =============================================================================
-# 8. [8] Rotation-jump diagnostic
-# =============================================================================
-
-def check_rotation_jumps(rot: np.ndarray, threshold_deg: float, label: str) -> int:
-    """Log frame-to-frame rotation changes above threshold (no state mutation).
-
-    dR = R[t+1] * R[t]^-1 ; angle = |axis-angle(dR)|
-    """
-    if len(rot) < 2:
-        return 0
-    R_t = Rotation.from_rotvec(rot)
-    dR = R_t[1:] * R_t[:-1].inv()
-    angles_deg = np.rad2deg(np.linalg.norm(dR.as_rotvec(), axis=1))
-    n_jumps = int((angles_deg > threshold_deg).sum())
-    if n_jumps > 0:
-        print(f"  [{label}] {n_jumps} rotation jumps > {threshold_deg:.0f}°/frame "
-              f"(max {angles_deg.max():.1f}°)")
-    return n_jumps
-
-
-# =============================================================================
-# 9. [9] Gripper normalize
-# =============================================================================
-
-def normalize_gripper(gripper_width: np.ndarray) -> np.ndarray:
-    """Map episode-local [min, max] → [0, 1]. Flat signal → zeros."""
-    gw_min = float(np.nanmin(gripper_width))
-    gw_max = float(np.nanmax(gripper_width))
-    if gw_max > gw_min:
-        norm = (gripper_width - gw_min) / (gw_max - gw_min)
-        return np.clip(norm, 0.0, 1.0).astype(np.float32)
-    return np.zeros_like(gripper_width, dtype=np.float32)
-
-
-# =============================================================================
-# 10. [10] State / action
-# =============================================================================
-
-def build_states_and_actions(
-    pos: np.ndarray,
-    rot: np.ndarray,
-    gripper: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Absolute-pose state/action. action[t] = state[t+1]; tail holds pose.
-
-    state[t] = [x, y, z, rx, ry, rz, gripper]  (7D, float32)
-    """
-    states = np.concatenate(
-        [pos, rot, gripper.reshape(-1, 1)], axis=1,
-    ).astype(np.float32)
-    actions = np.empty_like(states)
-    actions[:-1] = states[1:]
-    actions[-1] = states[-1]
-    return states, actions
-
-
-# =============================================================================
-# 11. Per-hand pipeline
-# =============================================================================
-
-def process_hand(hand_data: dict, config: ProcessConfig, label: str) -> dict:
-    """Run [1]–[10] on one hand. Returns the hand output dict.
-
-    If the hand is all-NaN or fails quality, returns a minimal dict with
-    quality_passed=False and a skip_reason (no trajectories inside).
-    """
-    # [1] Trim
-    trimmed = trim_hand(hand_data)
-    if trimmed is None:
-        print(f"  [{label}] no valid frames — skipping hand")
-        return {
-            "quality_passed": False,
-            "skip_reason":    "no valid frames",
-            "trim_slice":     None,
-        }
-    data, trim_slice = trimmed
-    n_trim = trim_slice[1] - trim_slice[0]
-    print(f"  [{label}] trim {trim_slice[0]}:{trim_slice[1]} ({n_trim} frames)")
-
-    # [2] World transform (adds eef_pos / eef_rot keys)
-    data = world_transform(data)
-
-    # [3] Center to robust anchor (median of first N valid frames)
-    data, center_offset = center_to_anchor(data, window_n=config.anchor_window_n)
-
-    # [4] Mark bad frames (position jumps → NaN)
-    data = mark_bad_frames(data, max_pos_jump_m=config.max_pos_jump_m)
-
-    # [5] Quality check (early reject)
-    passed, reason = quality_check(data, config)
-    if not passed:
-        print(f"  [{label}] SKIP: {reason}")
-        return {
-            "quality_passed":      False,
-            "skip_reason":         reason,
-            "trim_slice":          trim_slice,
-            "center_offset_world": center_offset,
-        }
-
-    # [6] Fill interior NaN
-    data = fill_tracking_result(data, trim_boundary_nans=False)
-
-    # [7] One-Euro filter
-    if config.enable_filter:
-        data = apply_one_euro(data, config)
-
-    # [8] Rotation-jump diagnostic
-    check_rotation_jumps(data["eef_rot"], config.rot_jump_warn_deg, label)
-
-    # [9] Gripper normalize
-    gripper_norm = normalize_gripper(data["gripper_width"])
-
-    # [10] State / action
-    states, actions = build_states_and_actions(
-        data["eef_pos"], data["eef_rot"], gripper_norm,
+    wrist_quat_world = transform_quats_cam_to_world(
+        cam_hand["wrist_quat_cam"], T_world_cam_slice,
     )
-
+    joints_world = transform_points_cam_to_world(
+        cam_hand["joints_cam"], T_world_cam_slice,
+    )
+    # Gripper: rigid-invariant under cam↔world, compute from cam joints to
+    # avoid extra precision loss from world transform on a difference.
+    joints_cam = cam_hand["joints_cam"]
+    thumb = joints_cam[:, _MANO_THUMB_TIP_IDX, :]
+    index_tip = joints_cam[:, _MANO_INDEX_TIP_IDX, :]
+    dist_m = np.linalg.norm(thumb - index_tip, axis=1)
+    span = max(_GRIPPER_OPEN_M - _GRIPPER_CLOSE_M, 1e-6)
+    # NaN propagates through the norm; clip ignores NaN (returns NaN).
+    gripper = np.clip((dist_m - _GRIPPER_CLOSE_M) / span, 0.0, 1.0)
     return {
-        "state":               states,
-        "action":              actions,
-        "wrist_world":         data["eef_pos"].astype(np.float64),
-        "wrist_rot_world":     data["eef_rot"].astype(np.float64),
-        "gripper_normalized":  gripper_norm,
-        "joints_cam":          data["joints_cam"],
-        "confidence":          data["confidence"],
-        "trim_slice":          trim_slice,
-        "center_offset_world": center_offset,
-        "quality_passed":      True,
-        "skip_reason":         "",
+        "wrist_world": wrist_world.astype(np.float64),
+        "wrist_quat_world": wrist_quat_world.astype(np.float64),
+        "joints_world": joints_world.astype(np.float64),
+        "gripper": gripper.astype(np.float64),
     }
 
 
-# =============================================================================
-# 12. Per-episode pipeline
-# =============================================================================
+_LINE_ROOT = _PROJECT_ROOT / "output" / "iphone"
+_STAGE = "02_processed"
 
-def process_episode(tracking: dict, config: ProcessConfig) -> dict:
-    """Apply processing pipeline to both hands of one episode."""
-    ep_name = tracking.get("episode_name", "unknown")
-    _validate_input(tracking, ep_name)
-    print(f"\n=== {ep_name} ===")
 
-    out = {
-        "timestamps":   tracking["timestamps"].copy(),
-        "T_world_cam":  tracking["T_world_cam"].copy(),
-        "K":            tracking["K"].copy(),
-        "source":       tracking.get("source", "unknown"),
-        "episode_name": ep_name,
-        "coord_frame":  "episode_local",
-    }
-    for hand in ("left", "right"):
-        cam_dict = _extract_hand_cam(tracking, hand)
-        out[f"{hand}_hand"] = process_hand(cam_dict, config, hand)
+def _resolve_batch(args) -> str:
+    """Auto-derive batch from input path. Convention: input .tracking.npz
+    lives at <_LINE_ROOT>/<batch>/01_tracking/<sid>/<sid>.tracking.npz, so
+    the batch is `--track-dir.parent.name` or `--track.parent.parent.parent.name`.
+    """
+    if args.batch:
+        return args.batch
+    if args.track_dir is not None:
+        # --track-dir = <batch>/01_tracking/  → batch = parent.name
+        return args.track_dir.resolve().parent.name
+    if args.track is not None:
+        # --track = <batch>/01_tracking/<sid>/<sid>.tracking.npz
+        # Walk up: file → <sid>/ → 01_tracking/ → <batch>/
+        return args.track.resolve().parents[2].name
+    raise ValueError(
+        "Cannot derive --batch: pass --batch <name> or --track-dir <dir>."
+    )
+
+
+def _axis_angle_to_quat_hemisphere(rotvec: np.ndarray) -> np.ndarray:
+    """Convert (T, 3) axis-angle → (T, 4) xyzw quat with hemisphere continuity.
+
+    NaN axis-angle rows produce NaN quat rows. Hemisphere fix: for each
+    valid quat, sign-flip if dot product with the previous valid quat is
+    negative — keeps q and -q (same rotation) on the same side so consumers
+    that interpolate / derivative the quat don't see spurious sign jumps.
+    """
+    n = len(rotvec)
+    out = np.full((n, 4), np.nan, dtype=np.float64)
+    valid = ~np.isnan(rotvec[:, 0])
+    if not valid.any():
+        return out
+
+    # Bulk convert valid rows.
+    out[valid] = Rotation.from_rotvec(rotvec[valid]).as_quat()  # xyzw
+
+    # Hemisphere continuity (one pass over the timeline).
+    prev = None
+    for i in range(n):
+        if not valid[i]:
+            continue
+        if prev is not None and float(np.dot(out[i], prev)) < 0.0:
+            out[i] = -out[i]
+        prev = out[i]
     return out
 
 
-# =============================================================================
-# 13. CLI
-# =============================================================================
+def _load_tracking_npz(npz_path: Path) -> dict:
+    """Return dict with timestamps_us, K, T_world_cam, source, episode_name,
+    and per-hand HAND_FIELDS arrays (axis-angle converted to xyzw quat)."""
+    d = np.load(npz_path, allow_pickle=True)
+    out = {
+        "timestamps_us": d["timestamps_us"],
+        "K": d["K"],
+        "T_world_cam": d["T_world_cam"],
+        "source": str(d["source"]) if "source" in d.files else "unknown",
+        "episode_name": str(d["episode_name"]) if "episode_name" in d.files else npz_path.stem,
+    }
+    for hand_name in ("left", "right"):
+        rot_aa = d[f"{hand_name}_wrist_rot_cam"]
+        quat = _axis_angle_to_quat_hemisphere(rot_aa)
+        out[hand_name] = {
+            "wrist_cam":      d[f"{hand_name}_wrist_cam"].copy(),
+            "wrist_quat_cam": quat,
+            "joints_cam":     d[f"{hand_name}_joints_cam"].copy(),
+            "bbox":           d[f"{hand_name}_bbox"].copy(),
+            "confidence":     d[f"{hand_name}_confidence"].copy(),
+        }
+    return out
+
+
+def _save_processed_npz(
+    path: Path,
+    *,
+    timestamps_us: np.ndarray,
+    K: np.ndarray,
+    T_world_cam: np.ndarray,
+    source: str,
+    episode_name: str,
+    raw_hands: dict,
+    processed_hands: dict,
+    stats_per_hand: dict,
+) -> None:
+    """Write npz with all per-hand fields + trim/quality flags.
+
+    Schema-stability rationale (matches 335 / LeRobot / NEP-12):
+      - All hand fields ALWAYS present so downstream code never KeyErrors
+      - <hand>_quality_passed flags whether the data was vetted (True) or
+        left raw (False)
+      - Quality-failed hands keep post-trim raw values for inspection
+    Episode-level drop is 03_build_source's concern, not 02's.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict = {
+        "timestamps_us": timestamps_us.astype(np.int64),
+        "K": K.astype(np.float64),
+        "T_world_cam": T_world_cam.astype(np.float64),
+        "source": np.array(source, dtype=object),
+        "episode_name": np.array(episode_name, dtype=object),
+    }
+    n_total = len(timestamps_us)
+    for hand_name in ("left", "right"):
+        s = stats_per_hand[hand_name]
+        passed = s["quality_passed"]
+        h = processed_hands[hand_name] if passed else None
+        if h is None:
+            sl_first, sl_last = s["trim_slice"]
+            h = {f: raw_hands[hand_name][f][sl_first:sl_last]
+                 for f in HAND_FIELDS}
+        first, last = s["trim_slice"]
+        for f in HAND_FIELDS:
+            full_shape = (n_total,) + h[f].shape[1:]
+            fill = 0.0 if f == "confidence" else np.nan
+            full = np.full(full_shape, fill, dtype=h[f].dtype)
+            full[first:last] = h[f]
+            payload[f"{hand_name}_{f}"] = full
+
+        # v2 derived: cam→world + gripper. Computed on the trimmed slice and
+        # padded to full length with NaN (matches NaN-padding for cam fields).
+        # Quality-failed hands still get world fields (computed from raw trimmed
+        # data) so downstream sees a uniform schema; mask via quality_passed.
+        T_wc_slice = T_world_cam[first:last]
+        derived = _compute_world_fields(h, T_wc_slice)
+        for f in HAND_FIELDS_V2:
+            full_shape = (n_total,) + derived[f].shape[1:]
+            full = np.full(full_shape, np.nan, dtype=np.float64)
+            full[first:last] = derived[f]
+            payload[f"{hand_name}_{f}"] = full
+
+        payload[f"{hand_name}_trim_first"] = np.int32(first)
+        payload[f"{hand_name}_trim_last"] = np.int32(last)
+        payload[f"{hand_name}_quality_passed"] = bool(passed)
+    np.savez_compressed(path, **payload)
+
+
+def _write_processed_meta(
+    path: Path,
+    *,
+    session_id: str,
+    source_track: Path,
+    source_r3d: Path | None,
+    cfg: ProcessConfig,
+    n_frames: int,
+    fps: float,
+    stats_per_hand: dict,
+    accepted_hands: list[str],
+    rejected_hands: list[tuple[str, str]],
+) -> None:
+    """Sidecar JSON summarising what was kept and what was rejected."""
+    meta = {
+        "session_id": session_id,
+        "source_track": str(source_track),
+        "source_r3d": str(source_r3d) if source_r3d else None,
+        "n_frames_total": n_frames,
+        "fps": fps,
+        "accepted_hands": accepted_hands,
+        "rejected_hands": [
+            {"hand": h, "reason": r} for h, r in rejected_hands
+        ],
+        "filter_config": {
+            "min_detection_rate": cfg.min_detection_rate,
+            "max_gap_frames": cfg.max_gap_frames,
+            "min_duration_s": cfg.min_duration_s,
+            "bbox_iou_trim_threshold": cfg.bbox_iou_trim_threshold,
+            "rot_jump_warn_rad": cfg.rot_jump_warn_rad,
+        },
+        "wrist_smoothing": "raw_pass_through",
+        "joint_smoothing": "raw_pass_through",
+        "world_frame": (
+            "ARKit T_world_cam stored per-frame; v2 npz fields "
+            "(wrist_world, wrist_quat_world, joints_world) are derived by "
+            "cam→world transform; cam-frame fields preserved for backward "
+            "compat with v1 readers (retarget/loader.py)."
+        ),
+        "schema_version": 2,
+        "schema_changes_v2": [
+            "Added per-hand wrist_world (T,3), wrist_quat_world (T,4), "
+            "joints_world (T,21,3) — cam→world via T_world_cam.",
+            "Added per-hand gripper (T,) [0,1] from MANO thumb-tip↔index-tip "
+            f"distance ({_GRIPPER_CLOSE_M}m closed → {_GRIPPER_OPEN_M}m open).",
+            "cam-frame fields (wrist_cam, wrist_quat_cam, joints_cam) "
+            "preserved unchanged for backward compatibility.",
+        ],
+        "per_hand_stats": stats_per_hand,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+
+
+def _discover_r3d(track_npz: Path) -> Path | None:
+    """Read source_r3d from tracking.meta.json sidecar (if present)."""
+    meta_path = track_npz.with_suffix(".meta.json")
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    sr = meta.get("source_r3d")
+    if not sr:
+        return None
+    p = Path(sr)
+    if not p.is_absolute():
+        p = _PROJECT_ROOT / p
+    return p if p.exists() else None
+
+
+def process_track(track_npz: Path, *, output_root: Path,
+                   cfg: ProcessConfig,
+                   save_preview: bool = True,
+                   orientation: str = "auto") -> dict:
+    """Process one .tracking.npz → <sid>/<sid>.processed.npz under output_root.
+
+    Returns a stats dict for batch aggregation.
+    """
+    sid = track_npz.stem.replace(".tracking", "")
+    out_dir = output_root / sid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npz_out = out_dir / f"{sid}.processed.npz"
+    meta_out = out_dir / f"{sid}.processed.meta.json"
+
+    print("=" * 70)
+    print(f"Process: {track_npz.name}")
+    r3d_path = _discover_r3d(track_npz)
+    print(f"  r3d:    {r3d_path}")
+    print(f"  output: {out_dir}")
+
+    track = _load_tracking_npz(track_npz)
+    ts_us = track["timestamps_us"]
+    K = track["K"]
+    T_world_cam = track["T_world_cam"]
+    n_frames = len(ts_us)
+
+    if n_frames >= 2:
+        # int64 microseconds → fps via median dt. ts == 0 (no-detect frames
+        # don't fill ts here; iPhone fills every frame) but be robust anyway.
+        valid_ts = ts_us[ts_us > 0]
+        if len(valid_ts) >= 2:
+            dt_us = np.median(np.diff(valid_ts))
+            fps_est = float(1e6 / dt_us) if dt_us > 0 else 30.0
+        else:
+            fps_est = 30.0
+    else:
+        fps_est = 30.0
+    print(f"  frames: {n_frames}, fps: {fps_est:.1f}")
+
+    raw_hands = {h: track[h] for h in ("left", "right")}
+
+    t0 = time.monotonic()
+    stats_per_hand: dict[str, dict] = {}
+    processed_hands: dict[str, dict | None] = {}
+    accepted_hands: list[str] = []
+    rejected_hands: list[tuple[str, str]] = []
+
+    for hand_name in ("left", "right"):
+        print(f"\n  [{hand_name}]")
+        processed, stats = process_hand(
+            raw_hands[hand_name], fps=fps_est, K=K, cfg=cfg,
+        )
+        stats_per_hand[hand_name] = stats
+        processed_hands[hand_name] = processed
+        first, last = stats["trim_slice"]
+        print(f"    trim:   [{first}..{last}) → {stats['n_after_trim']} frames "
+              f"(leading -{stats['n_trimmed_leading']}, "
+              f"trailing -{stats['n_trimmed_trailing']}, "
+              f"iou-rejected {stats['trim_iou_rejected']})")
+        if processed is None:
+            print(f"    quality: FAIL ({stats['skip_reason']}) — kept in npz "
+                  f"with {hand_name}_quality_passed=False (raw, untrimmed-mid)")
+            rejected_hands.append((hand_name, stats["skip_reason"]))
+            continue
+        print(f"    quality: PASS")
+        accepted_hands.append(hand_name)
+        rd = stats["rotation_diagnostic"]
+        if rd:
+            print(f"    rotation delta: median={rd['median_delta_rad']:.3f}rad, "
+                  f"max={rd['max_delta_rad']:.3f}rad, "
+                  f">{cfg.rot_jump_warn_rad}rad jumps={rd['n_jumps_above_threshold']}")
+
+    if not accepted_hands:
+        print(f"\n  ALL HANDS REJECTED — npz still has full schema with "
+              f"quality_passed=False on all hands")
+
+    _save_processed_npz(
+        npz_out,
+        timestamps_us=ts_us, K=K, T_world_cam=T_world_cam,
+        source=track["source"], episode_name=track["episode_name"],
+        raw_hands=raw_hands, processed_hands=processed_hands,
+        stats_per_hand=stats_per_hand,
+    )
+    _write_processed_meta(
+        meta_out,
+        session_id=sid, source_track=track_npz, source_r3d=r3d_path,
+        cfg=cfg, n_frames=n_frames, fps=fps_est,
+        stats_per_hand=stats_per_hand,
+        accepted_hands=accepted_hands, rejected_hands=rejected_hands,
+    )
+
+    print(f"\n  npz:  {npz_out.name}")
+    print(f"        accepted: {accepted_hands or 'NONE'}")
+    if rejected_hands:
+        for h, r in rejected_hands:
+            print(f"        rejected: {h} ({r}) — flagged in npz, raw kept")
+    print(f"  meta: {meta_out.name}")
+
+    # Preview mp4: post-trim + post-quality keypoints overlaid on source RGB.
+    # Same overlay style as 01 and 03 so users can flip across stages and
+    # see what each step changed. Raw HaMeR signal — no smoothing here, by
+    # design (02 is "raw-first"). Skip silently when r3d unavailable so a
+    # missing source doesn't fail the whole batch.
+    if save_preview:
+        if r3d_path is None:
+            print(f"  preview skipped: no source r3d for {sid}")
+        else:
+            mp4_out = out_dir / f"{sid}_preview.mp4"
+            try:
+                stats = render_preview_from_npz(
+                    sid=sid,
+                    stage_label="02_processed",
+                    npz_path=npz_out,
+                    source_r3d=r3d_path,
+                    out_mp4=mp4_out,
+                    orientation=orientation,
+                )
+                print(
+                    f"  preview: {stats['n_frames_with_hands']}/"
+                    f"{stats['n_frames_written']} frames with hands "
+                    f"@ {stats['fps']} fps  → {mp4_out.name}"
+                )
+            except Exception as exc:                 # noqa: BLE001
+                print(f"  preview FAILED for {sid}: {exc}")
+
+    print(f"  total: {time.monotonic() - t0:.1f}s")
+
+    return {"sid": sid, "n_frames": n_frames,
+            "accepted": accepted_hands, "rejected": rejected_hands}
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Process cam-frame tracking → world-frame episode-local dataset "
-            "input. Hands are processed independently; each gets its own trim "
-            "window and quality verdict."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python 02_process.py --input tracking.pkl --output processed.pkl
-  python 02_process.py --input tracking.pkl --output processed.pkl --no-filter
-        """,
+        description="Per-r3d tracking → trim+quality .processed.npz (raw-first)",
     )
-    parser.add_argument("--input", type=Path, required=True,
-                        help="cam-frame tracking pickle from 01_hand_track.py")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--fps", type=int, default=60)
-    parser.add_argument("--min-detect-rate", type=float, default=0.5)
-    parser.add_argument("--max-gap", type=int, default=30)
-    parser.add_argument("--max-pos-jump-m", type=float, default=0.05)
-    parser.add_argument("--min-duration-s", type=float, default=2.0)
-    parser.add_argument("--filter-min-cutoff", type=float, default=1.0)
-    parser.add_argument("--filter-beta", type=float, default=0.007)
-    parser.add_argument("--rot-jump-warn-deg", type=float, default=45.0)
-    parser.add_argument("--no-filter", action="store_true",
-                        help="Disable One-Euro filter")
+    g = parser.add_mutually_exclusive_group(required=True)
+    g.add_argument("--track", type=Path, default=None,
+                   help="Single .tracking.npz from 01_hand_track")
+    g.add_argument("--track-dir", type=Path, default=None,
+                   help="Directory tree to scan for .tracking.npz files")
+    parser.add_argument("--batch", type=str, default=None,
+                        help="Batch name (output goes to "
+                             f"{_LINE_ROOT}/<batch>/{_STAGE}/<sid>/). "
+                             "Default: derived from --track-dir parent.")
+    parser.add_argument("--output-root", type=Path, default=None,
+                        help=f"Override per-batch root. Default: "
+                             f"{_LINE_ROOT}/<batch>/{_STAGE}/")
+    parser.add_argument("--bbox-iou-trim-threshold", type=float, default=0.3,
+                        help="Trim leading/trailing frames where MediaPipe "
+                             "bbox and projected joint-cloud bbox have IoU "
+                             "below this. Catches HaMeR 'flying skeleton' "
+                             "frames at edges. 0=disabled.")
+    parser.add_argument("--min-detection-rate", type=float, default=0.5)
+    parser.add_argument("--max-gap-frames", type=int, default=30)
+    parser.add_argument("--min-duration-s", type=float, default=1.0)
+    parser.add_argument("--no-preview-video", action="store_true",
+                        help="Skip rendering the per-episode QA preview mp4. "
+                             "Default: write <sid>_preview.mp4 next to the "
+                             "processed npz, drawn with the trimmed/quality-"
+                             "filtered (but still raw, unsmoothed) keypoints.")
+    parser.add_argument("--orientation",
+                        choices=("auto", "landscape", "portrait"),
+                        default="auto",
+                        help="r3d frame rotation policy for the preview "
+                             "render. MUST match the orientation 01_hand_track "
+                             "was run with for this batch — K stored in the "
+                             "npz was baked under that rotation. Default "
+                             "'auto' matches 01's default.")
     args = parser.parse_args()
 
-    config = ProcessConfig(
-        fps=args.fps,
-        min_detect_rate=args.min_detect_rate,
-        max_consecutive_gap=args.max_gap,
-        max_pos_jump_m=args.max_pos_jump_m,
+    if args.track is not None:
+        tracks = [args.track]
+    else:
+        tracks = sorted(args.track_dir.rglob("*.tracking.npz"))
+        if not tracks:
+            raise FileNotFoundError(
+                f"No .tracking.npz under {args.track_dir}")
+    print(f"Found {len(tracks)} tracking file(s) to process")
+
+    batch = _resolve_batch(args)
+    output_root = args.output_root or (_LINE_ROOT / batch / _STAGE)
+    print(f"Batch:  {batch}")
+    print(f"Output: {output_root}")
+
+    cfg = ProcessConfig(
+        min_detection_rate=args.min_detection_rate,
+        max_gap_frames=args.max_gap_frames,
         min_duration_s=args.min_duration_s,
-        filter_min_cutoff=args.filter_min_cutoff,
-        filter_beta=args.filter_beta,
-        rot_jump_warn_deg=args.rot_jump_warn_deg,
-        enable_filter=not args.no_filter,
+        bbox_iou_trim_threshold=args.bbox_iou_trim_threshold,
     )
 
-    print(f"Loading {args.input} ...")
-    with open(args.input, "rb") as f:
-        tracking_results = pickle.load(f)
-    print(f"  {len(tracking_results)} episodes")
-
-    processed = [process_episode(t, config) for t in tracking_results]
-
-    # Per-hand pass / skip summary
-    print("\n=== Summary ===")
-    for hand in ("left", "right"):
-        n_pass = sum(r[f"{hand}_hand"].get("quality_passed", False)
-                     for r in processed)
-        print(f"  {hand}: {n_pass}/{len(processed)} episodes passed")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "wb") as f:
-        pickle.dump(processed, f)
-    print(f"\nSaved {len(processed)} episodes to {args.output}")
+    save_preview = not args.no_preview_video
+    print(f"Preview video: {'on' if save_preview else 'off'}"
+          f"  orientation={args.orientation}")
+    results = [
+        process_track(
+            t, output_root=output_root, cfg=cfg,
+            save_preview=save_preview, orientation=args.orientation,
+        )
+        for t in tracks
+    ]
+    print("=" * 70)
+    print(f"Done: {len(results)} track(s) processed under {output_root}")
 
 
 if __name__ == "__main__":

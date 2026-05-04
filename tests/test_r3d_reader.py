@@ -1,5 +1,5 @@
 """
-Tests for utils/r3d_reader.py
+Tests for utils/iphone/r3d_reader.py
 
 Focus:
   1. read_poses — shape, rotation orthogonality, [qx,qy,qz,qw] order
@@ -27,7 +27,7 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.r3d_reader import (
+from utils.iphone.r3d_reader import (
     needs_rotation,
     read_iphone_intrinsics,
     read_poses,

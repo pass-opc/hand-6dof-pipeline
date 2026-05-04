@@ -48,7 +48,7 @@ T = [ 0 -1  0 | 0.10 ]     左上 3x3 变成了 90° 旋转矩阵
 
 **代码对应**：`pose_to_mat()` 把 6D 转成 4x4，`mat_to_pose()` 转回来。内部运算全用 4x4，输入输出用 6D。
 
-**相关文件**：`utils/pose_util.py`
+**相关文件**：`utils/common/pose_util.py`
 
 ---
 
@@ -81,7 +81,7 @@ T = [ 0 -1  0 | 0.10 ]     左上 3x3 变成了 90° 旋转矩阵
 
 **不需要学群论**——知道 SE(3) = "合法的刚体变换 4x4 矩阵"就够了。
 
-**相关文件**：`utils/pose_util.py::invert_transform()`
+**相关文件**：`utils/common/pose_util.py::invert_transform()`
 
 ---
 
@@ -107,7 +107,7 @@ Zhou et al. (CVPR 2019) 证明了：任何少于 5 维的旋转表示都是**不
 
 > 注意：UMI 里叫 "pose10d"，但实际输出是 9D，不是 10D。这是 UMI 的命名错误，我们沿用了函数名但在测试中记录了这个问题。
 
-**相关文件**：`utils/pose_util.py::mat_to_rot6d()`、`utils/pose_util.py::mat_to_pose9d()`
+**相关文件**：`utils/common/pose_util.py::mat_to_rot6d()`、`utils/common/pose_util.py::mat_to_pose9d()`
 
 ---
 
@@ -149,7 +149,7 @@ rvec 本质就是 axis-angle，所以 `rvec_tvec_to_pose()` 直接拼接成 `[tv
 
 `cv2.Rodrigues()` 可以在 rvec（3D）和 3x3 旋转矩阵之间互转，但我们用 `scipy.spatial.transform.Rotation` 统一处理，不直接调 Rodrigues。
 
-**相关文件**：`utils/pose_util.py::rvec_tvec_to_pose()`、`utils/pose_util.py::rvec_tvec_to_mat()`、`scripts/01_aruco_detect.py::detect_aruco_markers()`
+**相关文件**：`utils/common/pose_util.py::rvec_tvec_to_pose()`、`utils/common/pose_util.py::rvec_tvec_to_mat()`、`scripts/01_aruco_detect.py::detect_aruco_markers()`
 
 ---
 
@@ -407,6 +407,219 @@ SO-arm FK:    state = FK(joints)                      ← 基座坐标系
 
 ---
 
+## URDF root / MJCF body / freejoint — MuJoCo 模型基本概念
+
+**URDF root link**：URDF (Unified Robot Description Format) 的根节点，机器人树结构的最上层。Shadow Hand URDF 的 root 是 `forearm`（前臂），所有 link 通过 joint 挂在它下面。
+
+**MuJoCo body**：MJCF（MuJoCo XML 格式）里的物理刚体，相当于 URDF 的 link。menagerie 把 Shadow Hand 的 URDF 转成 MJCF 后，root body 还是 `rh_forearm`。
+
+**freejoint**：MuJoCo 提供的特殊 joint 类型，给一个 body **6 个自由度**（3 平移 + 3 旋转）让它在 world 里自由漂浮。XML 写法：
+
+```xml
+<body name="rh_forearm">
+  <freejoint name="hand_base"/>     <!-- 让前臂能在 world 里自由飞 -->
+  ...
+</body>
+```
+
+**为什么 menagerie 默认没 freejoint**：菜单里假设手是"被固定底座"的（用于桌面上的抓取/操作 demo），所以 forearm 直挂 worldbody。**dex_retargeting 输出 6 个 dummy free joint dofs，要求 URDF root 有 freejoint** 才能消费这 6 个值。我们 runtime patch 把 freejoint 注入到 menagerie 的 right_hand.xml 副本里。
+
+**相关文件**：`replay/sim/mujoco_dex.py::_patch_hand_mjcf`
+
+---
+
+## qpos — MuJoCo 全局关节位置数组
+
+**定义**：MuJoCo 把模型里所有 joint 的当前值打包到一个 1D 浮点数组 `data.qpos`，长度叫 `model.nq`。
+
+**每种 joint 占用槽位数**：
+- **freejoint**：7 个 = `[tx, ty, tz, qw, qx, qy, qz]`（位置 + wxyz 四元数）
+- **hinge joint**：1 个（弧度角度）
+- **ball joint**：4 个（wxyz 四元数）
+- **slide joint**：1 个（米）
+
+**为什么 freejoint 是 wxyz 不是 xyzw**：MuJoCo 沿用 ROS / pinocchio / Eigen 默认的 wxyz（标量在前）。和 scipy 的 xyzw 必须做格式转换，**这是常见 bug 来源**。
+
+**Shadow Hand 我们的 patched scene 的 qpos 布局（nq=31）**：
+
+```
+qpos[0:3]   freejoint translation   米     (cam-frame world)
+qpos[3:7]   freejoint quat wxyz             (cam-frame world)
+qpos[7:31]  24 个 hinge 关节角     弧度    (rh_WRJ2..rh_THJ1, MJCF 顺序)
+```
+
+**怎么读写**：
+- 整体 `data.qpos` numpy array 直接索引（快但难读）
+- **官方推荐**：`data.joint("rh_FFJ4").qpos[0] = value`（按名字访问，自解释）
+- 写完后调 `mujoco.mj_forward(model, data)` 算 forward kinematics
+
+**相关文件**：`replay/sim/mujoco_dex.py::_apply_qpos`
+
+---
+
+## dex_retargeting qpos vs MuJoCo qpos — 格式差异 + 转换
+
+**dex_retargeting 输出**（Shadow Hand）：30 维 numpy array
+
+```
+qpos[0:3]   dummy XYZ translation     米       cam-frame
+qpos[3:6]   dummy XYZ Euler           弧度     intrinsic 内禀
+qpos[6:30]  24 个 finger 关节角       弧度     dex 顺序：FF→LF→MF→RF→TH
+```
+
+**和 MuJoCo qpos 的差异**：
+1. **维度差 1**：dex 旋转用 3D Euler，MuJoCo freejoint 用 4D wxyz quat
+2. **关节顺序不同**：dex `FF→LF→MF→RF→TH`；MJCF `FF→MF→RF→LF→TH`（LF/MF 互换）
+3. **关节命名不同**：dex `WRJ2/FFJ4/...`；MJCF `rh_WRJ2/rh_FFJ4/...`（多 `rh_` 前缀）
+
+**转换路径（我们 replay/sim/mujoco_dex 干的事）**：
+
+```python
+# 1. dex translation 直接搬运
+free_qpos[0:3] = q_dex[0:3]
+
+# 2. dex Euler → wxyz quat (with hemisphere continuity)
+quat_xyzw = Rotation.from_euler("XYZ", q_dex[3:6]).as_quat()
+if dot(prev_quat, quat_xyzw) < 0: quat_xyzw = -quat_xyzw  # 半球连续
+free_qpos[3:7] = [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]  # xyzw → wxyz
+
+# 3. 24 finger 按 joint name 映射
+for mjcf_name in ["rh_WRJ2", "rh_FFJ4", ...]:
+    bare = mjcf_name.removeprefix("rh_")             # FFJ4
+    dex_col = dex_joint_names.index(bare)
+    data.joint(mjcf_name).qpos[0] = q_dex[dex_col]
+```
+
+**相关文件**：`replay/sim/mujoco_dex.py::_apply_qpos`、`replay/sim/mujoco_dex.py::_build_pose_layout`
+
+---
+
+## warm_start — dex_retargeting 的初始化机制
+
+**定义**：`SeqRetargeting.warm_start(wrist_pos, wrist_quat, hand_type, is_mano_convention)` 是 dex 给 NLopt 优化器一个**分析解作为起始 qpos**，让首帧不要从随机点冷启动。
+
+**核心机理**：
+1. 用户传"我想让 wrist 链节摆到 (wrist_pos, wrist_quat)"
+2. dex 反推 URDF root 应该在哪：`target_root_pose = target_wrist_pose @ inv(root_to_wrist)`
+3. 把这个 pose 拆成（平移 3D + XYZ 内禀 Euler 3D）
+4. 写到 `self.last_qpos[dummy_6_columns]`
+5. 后续每帧 `retarget()` 用 `self.last_qpos` 当 NLopt 起点
+
+**关键约束 — 整集只调用一次**：
+- 调一次：起手优化连续，时序平滑
+- ❌ 每帧调：每帧重置 dummy 6，破坏 NLopt 的时序连续性，结果抖动剧烈
+
+**`is_mano_convention` 参数**：
+- `True`：传入的 wrist_quat 在 **MANO 坐标系约定**（直接来自 MANO global_orient axis-angle）。dex 内部应用 `OPERATOR2MANO.T` 转到 URDF wrist link 的 operator frame
+- `False`：传入的 wrist_quat 已经在 operator frame，dex 不再变换
+
+我们传 HaMeR 的 wrist_quat（cam-frame, MANO axis-angle 派生）→ `is_mano_convention=True`。
+
+**相关文件**：`retarget/` 模块（具体入口待确认）
+
+---
+
+## MJCF world frame — MuJoCo 世界坐标系
+
+**定义**：MJCF XML 里 `<worldbody>` 标签定义的根坐标系。所有 body 通过 joint 链挂在 worldbody 下，body 位姿是相对 world 的。
+
+**关键事实**：world frame 的方向**没有"标准"约定**，取决于 XML 怎么写。
+- MuJoCo 默认习惯（机器人学）：`x=forward, y=left, z=up`
+- 但**用户可以重新定义**——我们 sim 里把 world frame 当成录制相机的 cam frame 用：`x=右, y=下, z=前`，靠相机和数据约定一致
+
+**怎么决定"world 是什么"**：写 `<camera>` 时 `pos`、`xyaxes`、`mode` 决定相机相对 world 怎么放。我们的 `cam_frame` camera：
+
+```xml
+<camera name="cam_frame" pos="0 0 0" xyaxes="1 0 0  0 -1 0" mode="fixed"/>
+```
+- `pos="0 0 0"`：相机在 world 原点
+- `xyaxes="1 0 0  0 -1 0"`：相机的 X 轴对齐 world +X，相机的 Y 轴对齐 world -Y
+- 隐式 Z 轴 = X × Y = (0, 0, -1)
+- MuJoCo 相机看 -Z 方向 = world +Z
+
+→ 所以 cam_frame 在原点朝 world +Z 看，**视觉上**这个 sim world 就是 cam frame：x=右、y=下、z=前。
+
+**相关文件**：`replay/sim/mujoco_dex.py::_SCENE_TEMPLATE`
+
+---
+
+## fovy / focal length / 相机内参 K — 怎么对齐 sim 视角和真实相机
+
+**fovy (Vertical Field of View)**：垂直视场角，单位**度**。MuJoCo `<camera fovy="..."/>` 定义。默认 45°。
+
+**fovy 和相机内参 K 的关系**：
+
+```
+K = [ fx  0   cx ]
+    [ 0   fy  cy ]
+    [ 0   0   1  ]
+
+fovy = 2 * atan(image_height / (2 * fy))       (理想情况下)
+     = 2 * atan(cy / fy)                       (假设 cy = image_height/2，主点居中)
+```
+
+**OPC 实测样例（640×480 录制）**：
+- 实测 K：fy=463.20, cy=239.94
+- fovy = 2·atan(239.94/463.20) = **54.77°**
+
+**为什么不用 MuJoCo 默认 45°**：sim 渲染出来的"视野"会比真实 cam 窄约 22%，画面看着手放得太大、太近。**用 K 推算的 fovy 才能让 sim cam_frame 视角和录制时看到的画面比例完全一致**。
+
+**实现**：每集独立计算 fovy（每次录制 K 略有不同，可能受焦距/曝光影响）：
+1. `python -m retarget` 把 K 从源 npz 写进 qpos.meta.json `K_flat` 字段
+2. `replay/sim/mujoco_dex.py::_fovy_from_K()` 读 K，算 fovy，注入 scene XML 的 cam_frame camera
+
+**相关文件**：`replay/sim/mujoco_dex.py::_fovy_from_K`、`retarget/dex_hands.py`
+
+---
+
+## One-Euro filter — 自适应低通滤波器
+
+**定义**：Casiez et al. (2012) 的**低延迟自适应低通滤波器**。两个参数：
+
+| 参数 | 单位 | 物理意义 | 调高/调低的影响 |
+|---|---|---|---|
+| `min_cutoff` | Hz | 静止时的截止频率 | 越低过滤越狠（信号越平），延迟感越大 |
+| `beta` | 1/速度 | 速度对截止频率的影响系数 | 越大越能跟得上快动作，快动作时滤波弱 |
+
+**算法核心**：
+```
+α(speed) = exp(-2π · cutoff(speed) · dt)
+cutoff(speed) = min_cutoff + β · |signal_velocity|
+output[t] = α · output[t-1] + (1 - α) · input[t]    // 一阶 IIR 低通
+```
+
+**OPC pipeline 中**：raw 数据（02_processed）**不做**任何平滑（与 DexYCB / HumanPlus / DROID 一致）。`retarget/so101.py` 内部对 pinch midpoint 做 One-Euro 平滑（IK 输入端），其余下游平滑由客户/下游自行选择。
+
+**默认参数**：`min_cutoff=1.0 Hz, beta=0.05, d_cutoff=1.0 Hz`，全部用物理单位（Hz、秒），跨 fps 通用。
+
+**论文链接**：[https://gery.casiez.net/1euro/](https://gery.casiez.net/1euro/)
+
+**OPC 当前的"是否上游过滤"原则**：raw 02_processed **不做**任何平滑（与 DexYCB / HumanPlus / DROID 一致）。
+
+**相关文件**：`retarget/so101.py` 内 `_smooth_pinch_one_euro` 段
+
+---
+
+## "Anchor 模式"（已删除）— 为什么不是科研标准
+
+**定义**：渲染 sim 时把 freejoint 平移**强行写死**到一个固定点（中位数/首帧/用户指定），保留旋转和手指动作。视觉上手不再"飘"。
+
+**用谁的**：动画 / 角色 rigging（Maya / Blender / Unreal）有类似"锁底座调手指"的可视化技巧。
+
+**为什么 OPC 弃用**：
+- 数据真实性：anchor = 丢弃 dex 的 dummy translation 输出，**数据本身没改**，但渲染出的画面**不是 dex 真实给的轨迹**
+- 误导调试：以为"看着不抖了"就 OK，但**真实数据还是抖的**——下游训练完全不受益
+- 不是科研可视化标准：mocap / 仿真社区都展示真实空间轨迹
+
+**正路**：
+- 想看"姿态本身不受相机抖动影响" → 用 viewer 的 `cam_frame` / `hand_follow` 命名相机切视角，效果接近且诚实
+- 想真正抑制抖动 → 上游加 wrist 平滑（One-Euro 调参）或 cam 运动补偿（IMU dead-reckoning）
+- 想接受抖动是数据特征 → 不动，承认 egocentric 录制天然如此
+
+**相关文件**：（无；功能已从 `replay/sim/mujoco_dex.py` 删除）
+
+---
+
 ## PnP 跳变 vs Axis-Angle 2π 跳变 — 两种不同的"数值不连续"
 
 **PnP 跳变（真错误）**：marker 半遮挡/模糊时 solvePnP 给出不准确的位姿。xyz 和旋转都可能跳。转任何格式都无法修复——数据本身就是错的。
@@ -422,7 +635,7 @@ PnP 跳变:   帧100 xyz=[0.22, -0.09, -0.18]  ← PnP 算错了，需要过滤
 - PnP 跳变：`mark_bad_frames()` 标记为 NaN → 插值修复
 - 2π 跳变：训练时转 rot6d 自动解决，数据集阶段不处理
 
-**相关文件**：`utils/interpolation.py::mark_bad_frames()`
+**相关文件**：下游 retarget/replay 链路按需处理（本仓库的 02_processed 保留 NaN，不做插值；客户/下游自行选）
 
 ---
 

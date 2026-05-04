@@ -1,5 +1,5 @@
 """
-Tests for utils/pose_util.py
+Tests for utils/common/pose_util.py
 
 Verifies:
   1. pose_to_mat / mat_to_pose roundtrip consistency
@@ -23,7 +23,7 @@ import scipy.spatial.transform as st
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils.pose_util import (
+from utils.common.pose_util import (
     pose_to_mat,
     mat_to_pose,
     rvec_tvec_to_pose,

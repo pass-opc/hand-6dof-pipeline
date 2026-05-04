@@ -1,4 +1,4 @@
-"""Tests for spatial hand identity tracker (utils/spatial_tracker.py)."""
+"""Tests for spatial hand identity tracker (utils/hand_tracker/spatial_tracker.py)."""
 
 import numpy as np
 import pytest
@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.hand_tracker.base import HandDetection
-from utils.spatial_tracker import SpatialHandTracker, _bbox_center
+from utils.hand_tracker.spatial_tracker import SpatialHandTracker, _bbox_center
 
 
 def _make_det(

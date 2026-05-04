@@ -5,10 +5,25 @@ Shared IO layer for all pipeline scripts (01-04) and future HaMeR main line.
 Provides streaming frame access to avoid loading entire recordings into memory.
 
 Orientation handling:
-  Record3D stores JPEG data in the sensor's native orientation. When the phone
-  is held landscape, the image is sideways. This module detects landscape
-  recordings (W > H) and auto-rotates to portrait so all downstream code sees
-  a consistent orientation. Depth maps and intrinsics are rotated accordingly.
+  Record3D stores RGB / depth in either the sensor-native canvas (W > H,
+  iPhone wide camera is 4:3) or — when iOS screen rotation is locked to
+  portrait while the user holds the phone landscape — a portrait canvas
+  (W < H) into which the sensor data has been baked CW 90°. The right
+  rotation to normalize a recording therefore depends on what physical
+  orientation we *want* the output to be in. `resolve_rotation` returns
+  the per-recording image rotation under three named policies:
+
+    * 'auto'      — legacy heuristic. W > H → CCW 90° (results in portrait
+                    output). Pre-existing test_HaMeR_4_15 batch was processed
+                    this way; kept as default to preserve old behaviour.
+    * 'landscape' — restore the canonical sensor-native landscape view.
+                    W > H → keep, W < H → CCW 90° (undoes Record3D's CW 90°
+                    canvas rotation).
+    * 'portrait'  — mirror of 'landscape' for portrait outputs.
+
+  All math (K transform, ARKit pose right-multiply, RGB / depth rotate) is
+  driven from a single resolved string ('ccw90' or None) so the policy
+  branch lives in exactly one place.
 
 .r3d format: ZIP archive containing:
   - metadata (JSON): fps, timestamps, intrinsics, depth resolution
@@ -28,19 +43,53 @@ import numpy as np
 # 1. Orientation Detection
 # =============================================================================
 
-def needs_rotation(metadata: dict) -> bool:
-    """Check if frames need 90° rotation to normalize to portrait orientation.
+# Public modes accepted by resolve_rotation / read_iphone_intrinsics /
+# read_poses / iter_r3d_frames. 'auto' preserves legacy behaviour (W > H →
+# CCW 90°). 'landscape' / 'portrait' make the *output* orientation explicit
+# regardless of how Record3D stored the canvas.
+ORIENTATION_MODES = ("auto", "landscape", "portrait")
 
-    Record3D metadata w/h reflects pixel dimensions as stored. When W > H the
-    phone was held landscape and frames must be rotated CCW 90° to portrait.
+
+def resolve_rotation(metadata: dict, mode: str = "auto") -> str | None:
+    """Decide what canvas rotation to apply to a single recording.
+
+    Returns either None or 'ccw90'. The caller plumbs that string into
+    `_rotate_frame_ccw90`, the K transform, and the pose right-multiply.
+
+    Why a single resolved string instead of branching on `mode` everywhere:
+    keeping the math one-armed (ccw90 only) means the K formula and the
+    pose adjustment derived for the legacy landscape→portrait case carry
+    over verbatim — direction is the same, only the trigger condition
+    differs across modes.
     """
+    if mode not in ORIENTATION_MODES:
+        raise ValueError(
+            f"Unknown orientation mode {mode!r}; expected one of {ORIENTATION_MODES}"
+        )
     w = metadata.get("w", 0)
     h = metadata.get("h", 0)
-    return w > h
+    if mode == "auto":
+        # Legacy: W > H assumed sensor-native landscape, rotate to portrait.
+        return "ccw90" if w > h else None
+    if mode == "landscape":
+        # Already landscape canvas → keep. Portrait canvas → undo Record3D's
+        # CW 90° bake by applying CCW 90°.
+        return None if w > h else "ccw90"
+    # mode == "portrait"
+    return "ccw90" if w > h else None
+
+
+def needs_rotation(metadata: dict) -> bool:
+    """Backward-compat wrapper. True iff legacy 'auto' mode would rotate.
+
+    Older callers used this as a bool check; new code should call
+    resolve_rotation() directly to access non-default modes.
+    """
+    return resolve_rotation(metadata, mode="auto") == "ccw90"
 
 
 def _rotate_frame_ccw90(img: np.ndarray) -> np.ndarray:
-    """Rotate image 90° counter-clockwise (landscape → portrait)."""
+    """Rotate image 90° counter-clockwise."""
     return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
@@ -66,11 +115,18 @@ def _extract_intrinsics_raw(metadata: dict, frame_idx: int = 0) -> tuple[float, 
         raise ValueError("No intrinsics found in Record3D metadata")
 
 
-def read_iphone_intrinsics(metadata: dict, frame_idx: int = 0) -> np.ndarray:
+def read_iphone_intrinsics(
+    metadata: dict,
+    frame_idx: int = 0,
+    *,
+    orientation: str = "auto",
+) -> np.ndarray:
     """Extract camera intrinsic matrix K from Record3D metadata.
 
-    Automatically adjusts for orientation: if the recording is landscape
-    and will be rotated CCW 90° to portrait, K is transformed to match.
+    Adjusts K to match whatever rotation `resolve_rotation(metadata,
+    orientation)` decides will be applied to RGB / depth, so projecting a
+    cam-frame 3D point with the returned K lands on the same pixel that
+    iter_r3d_frames yields for that frame.
 
     CCW 90° rotation maps pixel (u, v) → (v, W-1-u), so:
       fx_new = fy, fy_new = fx, cx_new = cy, cy_new = W-1-cx
@@ -80,7 +136,7 @@ def read_iphone_intrinsics(metadata: dict, frame_idx: int = 0) -> np.ndarray:
     """
     fx, fy, cx, cy = _extract_intrinsics_raw(metadata, frame_idx)
 
-    if needs_rotation(metadata):
+    if resolve_rotation(metadata, orientation) == "ccw90":
         W_orig = metadata["w"]
         # CCW 90°: (u, v) → (v, W-1-u)
         fx, fy = fy, fx
@@ -110,18 +166,22 @@ def scale_intrinsics(K: np.ndarray, src_wh: tuple[int, int], dst_wh: tuple[int, 
 # 2b. ARKit World→Camera Poses
 # =============================================================================
 
-def read_poses(r3d_path: Path) -> np.ndarray:
-    """Read per-frame ARKit T_world_cam, aligned with the portrait RGB stream.
+def read_poses(r3d_path: Path, *, orientation: str = "auto") -> np.ndarray:
+    """Read per-frame ARKit T_world_cam, aligned with the rotated RGB stream.
 
     Record3D metadata['poses'] is a list of [qx, qy, qz, qw, tx, ty, tz] per
     frame. Each represents T_world_cam: the sensor-native camera pose in
     ARKit's gravity-aligned world (+Y up, origin = session start pose).
 
-    When the recording is landscape, iter_r3d_frames auto-rotates RGB CCW 90°
-    to portrait and read_iphone_intrinsics adjusts K accordingly. The camera
-    pose must follow: T_world_cam_port = T_world_cam_raw @ T_raw_from_port,
-    where R_raw_from_port = [[0,1,0],[-1,0,0],[0,0,1]] (image CCW 90° ↔
-    camera-frame +90° about +Z optical axis).
+    When iter_r3d_frames applies CCW 90° to RGB (per `orientation`), the
+    camera frame attached to the rotated canvas differs from the sensor
+    frame ARKit reports. We right-multiply the pose so consumers see
+    T_world_cam in the rotated canvas frame:
+        T_world_cam_new = T_world_cam_raw @ R_raw_from_new
+    where R_raw_from_new = [[0,1,0],[-1,0,0],[0,0,1]] (image CCW 90° ↔
+    camera-frame +90° about +Z optical axis). The rotation matrix is the
+    same regardless of starting/ending orientation; only whether to apply
+    it depends on `orientation`.
     """
     from scipy.spatial.transform import Rotation
 
@@ -141,7 +201,7 @@ def read_poses(r3d_path: Path) -> np.ndarray:
     R_wc = Rotation.from_quat(poses[:, :4]).as_matrix()  # (T, 3, 3)
     t_wc = poses[:, 4:7]                                 # (T, 3)
 
-    if needs_rotation(metadata):
+    if resolve_rotation(metadata, orientation) == "ccw90":
         R_raw_from_port = np.array(
             [[0.0,  1.0, 0.0],
              [-1.0, 0.0, 0.0],
@@ -186,26 +246,31 @@ def iter_r3d_frames(
     read_depth: bool = False,
     sample_every: int = 1,
     frame_indices: set[int] | None = None,
+    *,
+    orientation: str = "auto",
 ):
     """Yield (frame_index, rgb, timestamp, depth_or_None) one frame at a time.
 
     Streaming reader: only one frame lives in memory at any time.
     This is the standard memory-safe pattern (same as UMI's PyAV decode loop).
 
-    Orientation: landscape recordings (W > H) are auto-rotated CCW 90° to
-    portrait so all downstream code sees consistent orientation.
+    Orientation is resolved per-recording via `resolve_rotation(metadata,
+    orientation)`. When the resolution is 'ccw90', RGB and depth are
+    rotated CCW 90° before being yielded. K (read_iphone_intrinsics) and
+    pose (read_poses) called with the same `orientation` will be aligned.
 
     Args:
         sample_every: Yield every N-th frame (1 = all). Applied before frame_indices.
         frame_indices: If given, only yield frames whose index is in this set.
             Useful for trim alignment (e.g. skip leading/trailing NaN frames).
+        orientation: 'auto' | 'landscape' | 'portrait'. See module docstring.
 
     Yields:
         (frame_index, rgb, timestamp, depth)
         - frame_index: int, 0-based index in the original recording
-        - rgb: (H, W, 3) uint8 RGB, always portrait orientation
+        - rgb: (H, W, 3) uint8 RGB, in the canvas frame chosen by `orientation`
         - timestamp: float, seconds
-        - depth: (dh, dw) float32 meters (portrait), or None if read_depth=False
+        - depth: (dh, dw) float32 meters, or None if read_depth=False
     """
     with zipfile.ZipFile(r3d_path, "r") as zf:
         metadata = json.loads(zf.read("metadata"))
@@ -213,7 +278,8 @@ def iter_r3d_frames(
         fps = metadata.get("fps", 60)
         dw = metadata.get("dw", 0)
         dh = metadata.get("dh", 0)
-        rotate = needs_rotation(metadata)
+        rotation = resolve_rotation(metadata, orientation)
+        rotate = rotation == "ccw90"
 
         jpg_names = sorted(
             [n for n in zf.namelist() if n.startswith("rgbd/") and n.endswith(".jpg")],
@@ -221,7 +287,9 @@ def iter_r3d_frames(
         )
 
         if rotate and jpg_names:
-            print(f"  [r3d_reader] Landscape recording detected, auto-rotating CCW 90°")
+            print(f"  [r3d_reader] orientation={orientation!r}: applying CCW 90° "
+                  f"(canvas {metadata.get('w')}x{metadata.get('h')} → "
+                  f"{metadata.get('h')}x{metadata.get('w')})")
 
         for i, jpg_name in enumerate(jpg_names):
             if sample_every > 1 and i % sample_every != 0:

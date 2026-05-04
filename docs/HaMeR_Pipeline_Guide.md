@@ -245,7 +245,7 @@ LeRobot v3 字段：
 | 字段 | Shape | 用途 |
 |:-----|:------|:-----|
 | `observation.images.rgb` | video (480,640,3) | MP4 (AV1) |
-| `observation.images.depth` | video | 可选，LiDAR |
+| `observation.depth` | uint16 (480,640) | 可选，LiDAR raw mm |
 | `observation.state` | (7,) | `[x, y, z, rx, ry, rz, gripper]` (episode-local) |
 | `action` | (7,) | `state[t+1]` |
 
